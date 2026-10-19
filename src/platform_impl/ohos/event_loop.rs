@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use openharmony_ability::xcomponent::{Action, MouseButton as OhosMouseButton, TouchEvent};
 use openharmony_ability::{
-  ime::KeyboardStatus, Event as MainEvent, ImeEvent, InputEvent, OpenHarmonyApp, OpenHarmonyWaker,
+  ime::KeyboardStatus, CursorUntracked, Event as MainEvent, ImeEvent, InputEvent, OpenHarmonyApp,
+  OpenHarmonyWaker,
 };
 use openharmony_ability::{AxisEventData, InputSourceType, MouseAction, MouseEventData};
 use openharmony_ability_plugin_app_control::{AppControlExt, ColorModeExt};
@@ -81,10 +82,12 @@ pub(crate) fn effective_theme(app: &OpenHarmonyApp) -> Theme {
 }
 
 /// Last known cursor position lives in the process-level cursor statics inside
-/// openharmony-ability (vp, MainPage-relative), fed by the ArkTS
-/// `MainPage.onMouse` handler via the `update_cursor_position` NAPI function
-/// and read back through `OpenHarmonyApp::cursor_position()` (physical px).
-/// The NDK XComponent mouse path never fires while the cursor is over the
+/// openharmony-ability (screen-global vp, fed by the ArkTS `onMouse` handlers
+/// of MainPage AND FloatPage via the `update_cursor_position` NAPI function —
+/// ohos-cursor-passthrough D1/D2) and is read back through
+/// `OpenHarmonyApp::cursor_position()` (physical px). Never-fed reads fail
+/// with the typed untracked error → `ExternalError::NotSupported` (D3/R5);
+/// the NDK XComponent mouse path never fires while the cursor is over the
 /// WebView (which covers the window), so it cannot be the tracking source.
 
 /// Background tokio runtime for spawning async bridge calls (fire-and-forget).
@@ -258,16 +261,32 @@ fn emit_synthetic_key<T: 'static>(
 
 /// Shared cursor-position read (physical px), used by both
 /// `EventLoopWindowTarget::cursor_position` and `Window::cursor_position`.
-/// Fed by the ArkTS `MainPage.onMouse` handler via the
-/// `update_cursor_position` NAPI function; the vp→physical conversion and the
-/// bit-unpacking of the process statics live inside
-/// `OpenHarmonyApp::cursor_position` (issue #87 major-10) — see the
-/// CURSOR_POSITION note near the top of this file.
+/// Fed by the ArkTS `onMouse` handlers (MainPage AND FloatPage —
+/// ohos-cursor-passthrough D2) via the `update_cursor_position` NAPI
+/// function; the vp→physical conversion and the bit-unpacking of the process
+/// statics live inside `OpenHarmonyApp::cursor_position` (issue #87 major-10)
+/// — see the CURSOR_POSITION note near the top of this file.
+///
+/// Untracked fail-safe contract (ohos-cursor-passthrough D3, R5 — behavior
+/// change): when no feed was ever recorded the read is the typed
+/// `CursorUntracked` error, mapped here onto `ExternalError::NotSupported`
+/// (the §1.5 error-conversion constraint: single variant, no wrapping) —
+/// NOT swallowed into `Ok((0,0))`, which was indistinguishable from a real
+/// screen-origin feed. runtime-wry maps `NotSupported` to
+/// `FailedToGetCursorPosition`, so the tauri command and the JS
+/// `cursorPosition()` promise reject; app-side discipline (spec): catch →
+/// keep `set_ignore_cursor_events(true)`, only a hit-test match may set
+/// touchable.
 pub(crate) fn cursor_position_from_app(
   app: &OpenHarmonyApp,
 ) -> Result<PhysicalPosition<f64>, error::ExternalError> {
-  let (x, y) = app.cursor_position();
-  Ok(PhysicalPosition::new(x, y))
+  app
+    .cursor_position()
+    .map(|(x, y)| PhysicalPosition::new(x, y))
+    .map_err(|CursorUntracked| {
+      log::warn!("cursor_position: untracked (no mouse feed ever recorded) → NotSupported");
+      error::ExternalError::NotSupported(error::NotSupportedError::new())
+    })
 }
 
 /// Shared set_theme: write the global override (so `theme()` immediately

@@ -303,6 +303,9 @@ impl<T> EventLoopWindowTarget<T> {
   /// ## Platform-specific
   ///
   /// - **iOS / Android / Linux(Wayland)**: Unsupported, returns `0,0`.
+  /// - **OHOS**: fed by the ArkTS `onMouse` handlers (screen-global frame);
+  ///   before any feed the call fails with `Err(NotSupported)` instead of
+  ///   returning the `(0,0)` sentinel (ohos-cursor-passthrough D3/R5).
   #[inline]
   pub fn cursor_position(&self) -> Result<PhysicalPosition<f64>, ExternalError> {
     self.p.cursor_position()
