@@ -156,6 +156,9 @@ impl MonitorHandle {
   ///
   /// ## Platform-specific
   /// - **Linux:** Unsupported. This will always return empty iterator.
+  /// - **OpenHarmony:** Returns a single item — the monitor's current mode. The
+  ///   OHOS SDK exposes no per-display video-mode list and no color-depth API
+  ///   (see the impl comment in `platform_impl::ohos::MonitorHandle::video_modes`).
   #[inline]
   pub fn video_modes(&self) -> impl Iterator<Item = VideoMode> {
     self.inner.video_modes()

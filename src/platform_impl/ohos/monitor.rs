@@ -115,6 +115,13 @@ impl MonitorHandle {
 
   pub fn video_modes(&self) -> impl Iterator<Item = monitor::VideoMode> {
     let size = self.size().into();
+    // Single-item disclosure (committer Eulogizethesun/tauri#183): OHOS
+    // exposes exactly one "current mode" per display — the SDK has no
+    // per-display video-mode list API and no color-depth API (only the
+    // wide-gamut `colorSpaces` capability, which is not a mode/bit-depth
+    // surface), so bit_depth is reported as the fixed 32 (RGBA8888).
+    // Multi-display enumeration/sizes/refresh rates are real values from
+    // DisplayManager (see ohos-monitor-real-values, issue #106).
     // refresh_rate from OHOS DisplayManager real value (see ohos-monitor-real-values).
     // bit_depth fixed at 32 (RGBA8888) — OHOS exposes no per-display color
     // depth; see ohos-monitor-degradation.

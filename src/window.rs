@@ -752,11 +752,16 @@ impl Window {
   /// - **iOS:** Can only be called on the main thread. Sets the top left coordinates of the
   ///   window in the screen space coordinate system.
   /// - **Android / Linux(Wayland):** Unsupported.
-  /// - **OpenHarmony:** Only affects Float sub-windows (window_id > 0). The main UIAbility
-  ///   window (window_id = 0) is system-managed — `window.Window.moveWindowTo()` returns
-  ///   error 1300002 ("window state is abnormal"), so the call is a silent no-op for the
-  ///   main window. Create a Float sub-window via `WebviewWindowBuilder` (or
-  ///   `create_os_window`) to set position.
+  /// - **OpenHarmony:** The dispatch chain runs unconditionally — `move_window_to` forwards to
+  ///   `window.Window.moveWindowTo(x, y)` for both the main UIAbility window (window_id = 0)
+  ///   and Float sub-windows (see `doc/ohos-window-test-mapping.md`). Two caveats: the resize
+  ///   path is clamped by the system WM (freeform windows), and for the main window the move
+  ///   itself is dispatched but the resulting geometry is not reliably readable back from JS
+  ///   (`outer_position()` reads the `window_rect` callback, which a pure move does not
+  ///   trigger). Error 1300002 ("window state is abnormal") only appears transiently when the
+  ///   window is in an abnormal state — it is not the expected outcome of a main-window call
+  ///   (an earlier revision of this note claimed a guaranteed 1300002 + silent no-op, which
+  ///   contradicted the implementation).
   #[inline]
   pub fn set_outer_position<P: Into<Position>>(&self, position: P) {
     self.window.set_outer_position(position.into())
@@ -785,11 +790,14 @@ impl Window {
   /// ## Platform-specific
   ///
   /// - **iOS / Android:** Unsupported.
-  /// - **OpenHarmony:** Only affects Float sub-windows (window_id > 0). The main UIAbility
-  ///   window (window_id = 0) is system-managed — `window.Window.resize()` returns error
-  ///   1300002 ("window state is abnormal"), so the call is a silent no-op for the main
-  ///   window. Create a Float sub-window via `WebviewWindowBuilder` (or `create_os_window`)
-  ///   to resize.
+  /// - **OpenHarmony:** The dispatch chain runs unconditionally — `resize_window` forwards to
+  ///   `window.Window.resize(w, h)` with exact decor compensation, for both the main UIAbility
+  ///   window (window_id = 0) and Float sub-windows (see `doc/ohos-window-test-mapping.md`).
+  ///   The resize takes effect but the applied size is clamped by the system WM (freeform
+  ///   windows), so the result may differ from the requested value. Error 1300002 ("window
+  ///   state is abnormal") only appears transiently when the window is in an abnormal state —
+  ///   it is not the expected outcome of a main-window call (an earlier revision of this note
+  ///   claimed a guaranteed 1300002 + silent no-op, which contradicted the implementation).
   #[inline]
   pub fn set_inner_size<S: Into<Size>>(&self, size: S) {
     self.window.set_inner_size(size.into())
@@ -911,6 +919,10 @@ impl Window {
   /// ## Platform-specific
   ///
   /// - **iOS / Android:** Unsupported.
+  /// - **OpenHarmony:** Returns the intent bit recorded by
+  ///   [`Window::set_always_on_top`](Self::set_always_on_top), not the system
+  ///   truth — the platform exposes no synchronous always-on-top query, so this
+  ///   can drift from the actual z-order.
   #[inline]
   pub fn is_always_on_top(&self) -> bool {
     self.window.is_always_on_top()
@@ -1093,6 +1105,11 @@ impl Window {
   /// - **Windows:** Screen saver is disabled in fullscreen mode.
   /// - **Linux:** The window will only fullscreen to current monitor no matter which enum variant.
   /// - **Android:** Unsupported.
+  /// - **OpenHarmony:** Both `Fullscreen` variants fold into the same immersive
+  ///   boolean switch (no exclusive-fullscreen concept); `fullscreen()` always
+  ///   reports `Fullscreen::Borderless(None)` regardless of what was set. The
+  ///   intent is not read back from the system (deliberate — reading it back
+  ///   would introduce a second, drift-prone source of truth).
   #[inline]
   pub fn set_fullscreen(&self, fullscreen: Option<Fullscreen>) {
     self.window.set_fullscreen(fullscreen)
@@ -1128,6 +1145,9 @@ impl Window {
   /// - **Windows**: There is no guarantee that the window will be the bottom most but it will try to be.
   /// - **Linux(x11):** Result depends on the system's window manager. Consider this setting a suggestion.
   /// - **Linux(Wayland) / iOS / Android:** Unsupported.
+  /// - **OpenHarmony:** Unsupported — the OHOS platform backend has no
+  ///   implementation, so the call is a no-op that logs one warn entry; the
+  ///   signature stays `()` (it does not return `Err`).
   // TODO: Unsupported in gtk4
   #[inline]
   pub fn set_always_on_bottom(&self, always_on_bottom: bool) {
@@ -1140,6 +1160,10 @@ impl Window {
   ///
   /// - **Linux(x11):** Result depends on the system's window manager. Consider this setting a suggestion.
   /// - **Linux(Wayland) / iOS / Android:** Unsupported.
+  /// - **OpenHarmony:** Records the intent bit and dispatches `setWindowTopmost`
+  ///   (API 14+, requires `ohos.permission.WINDOW_TOPMOST`); only effective for
+  ///   freeform windows — the main (UIAbility) window is the supported form, and
+  ///   Float sub-windows error out (caught + warned in ArkTS, non-fatal).
   // TODO: Unsupported in gtk4
   #[inline]
   pub fn set_always_on_top(&self, always_on_top: bool) {
@@ -1176,6 +1200,9 @@ impl Window {
   ///
   /// - **Linux / macOS**: Unlike windows, progress bar is app-wide and not specific to this window. Only supported desktop environments with `libunity` (e.g. GNOME).
   /// - **iOS / Android:** Unsupported.
+  /// - **OpenHarmony:** Unsupported — silent no-op (the OHOS platform backend has
+  ///   no implementation, so the facade body is compiled out for OHOS), same as
+  ///   the upstream iOS/Android behavior; OHOS has no taskbar progress concept.
   #[inline]
   pub fn set_progress_bar(&self, _progress: ProgressBarState) {
     #[cfg(all(
@@ -1259,6 +1286,8 @@ impl Window {
   /// ## Platform-specific
   ///
   /// - **iOS / Android / Windows:** Unsupported.
+  /// - **OpenHarmony:** Unsupported — silent no-op (no OHOS implementation; the
+  ///   facade body is compiled out for OHOS). OHOS has no multi-workspace concept.
   pub fn set_visible_on_all_workspaces(&self, #[allow(unused)] visible: bool) {
     #[cfg(all(
       any(target_os = "macos", target_os = "linux"),
@@ -1296,6 +1325,8 @@ impl Window {
   /// ## Platform-specific
   ///
   /// - **iOS / Android:** Always returns an [`ExternalError::NotSupported`].
+  /// - **OpenHarmony:** Always returns an [`ExternalError::NotSupported`] (same
+  ///   shape as iOS/Android — the platform exposes no warp-cursor API).
   #[inline]
   pub fn set_cursor_position<P: Into<Position>>(&self, position: P) -> Result<(), ExternalError> {
     self.window.set_cursor_position(position.into())
@@ -1310,6 +1341,13 @@ impl Window {
   ///
   /// - **macOS:** This locks the cursor in a fixed location, which looks visually awkward.
   /// - **iOS / Android:** Always returns an [`ExternalError::NotSupported`].
+  /// - **OpenHarmony:** API 22+ only — `OH_WindowManager_LockCursor` (resolved via
+  ///   dlopen in openharmony-ability); lower API versions return
+  ///   [`ExternalError::NotSupported`]. The lock is confined-follow (cursor stays
+  ///   within the window area, like Windows `ClipCursor`) and is only effective
+  ///   while the window is focused: the system releases it automatically on focus
+  ///   loss, so apps that need a persistent lock must listen for `Focused(true)`
+  ///   and re-grab.
   #[inline]
   pub fn set_cursor_grab(&self, grab: bool) -> Result<(), ExternalError> {
     self.window.set_cursor_grab(grab)

@@ -66,6 +66,13 @@ pub enum OHOSWindowKind {
 /// constraint it enforces: the first window must be a UIAbility — a Float
 /// window has no container to attach to. Replaces the old `UIABILITY_CREATED`
 /// singleton guard (design D2).
+///
+/// Process-lifetime bootstrap marker (committer Eulogizethesun/tauri#169):
+/// it is deliberately NOT reset on window `Drop` — `Drop` only unregisters
+/// the per-window state mirror, so the latch keeps recording "a UIAbility
+/// container exists in this process". Later windows therefore default to
+/// `OHOSWindowKind::Float`, while an explicit UIAbility request stays legal
+/// (it spawns a fresh EntryAbility via the spawn chain).
 static FIRST_WINDOW_CREATED: AtomicBool = AtomicBool::new(false);
 
 /// Decoration button bitfield constants (aligned with openharmony-ability ArkTS).
@@ -1534,7 +1541,12 @@ impl Window {
       });
     }
   }
-  pub fn set_always_on_bottom(&self, _always_on_bottom: bool) {}
+  pub fn set_always_on_bottom(&self, _always_on_bottom: bool) {
+    // Committer Eulogizethesun/tauri#171: surface the no-op instead of failing
+    // silently (signature intentionally stays `()` — no `Err`, per the md
+    // wave-0 ruling), aligned with the iOS `log::warn!` precedent.
+    log::warn!("[tao-ohos] set_always_on_bottom is not supported on OHOS; call ignored");
+  }
 
   pub fn set_always_on_top(&self, always_on_top: bool) {
     // Records intent (is_always_on_top reads this) AND dispatches to OHOS
