@@ -899,6 +899,11 @@ impl Window {
   /// - **macOS**: If the window is already focused, it is not possible to unfocus it after calling `set_focusable(false)`.
   ///   In this case, you might consider calling [`Window::set_focus`] but it will move the window to the back i.e. at the bottom in terms of z-order.
   /// - **iOS / Android:** Unsupported.
+  /// - **OpenHarmony**: Forwarded to the window manager for the main window
+  ///   and Float sub-windows alike; success or rejection is arbitrated by the
+  ///   system (device arbitration 2026-10-21: the main window path is
+  ///   dispatched, not silently no-op'd — a rejection surfaces as a warning
+  ///   log carrying the window id and the platform error).
   #[inline]
   pub fn set_focusable(&self, focusable: bool) {
     self.window.set_focusable(focusable)

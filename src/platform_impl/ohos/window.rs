@@ -104,15 +104,22 @@ pub(crate) struct WindowStateMirror {
   pub(crate) maximized: AtomicBool,
   /// State mirror for is_minimized() — same backfill contract as `maximized`.
   pub(crate) minimized: AtomicBool,
+  /// Per-window focused bit (#173): written by the event-loop focus arms
+  /// (GainedFocus / LostFocus) through [`set_mirror_focused`] so the mirror
+  /// records per-window system truth. Intentionally NOT read by
+  /// `Window::is_focused()` — that stays on the app-level HAS_FOCUS static
+  /// (changing the read source was explicitly out of scope for #173).
+  pub(crate) focused: AtomicBool,
 }
 
 impl WindowStateMirror {
-  fn new() -> Self {
+  fn new(focused: bool) -> Self {
     Self {
       visible: AtomicBool::new(true),
       fullscreen: AtomicBool::new(false),
       maximized: AtomicBool::new(false),
       minimized: AtomicBool::new(false),
+      focused: AtomicBool::new(focused),
     }
   }
 
@@ -173,6 +180,73 @@ impl WindowStateMirror {
 pub(crate) static WINDOW_MIRRORS: std::sync::LazyLock<
   std::sync::Mutex<std::collections::HashMap<i64, std::sync::Weak<WindowStateMirror>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Serializes the tests that populate [`WINDOW_MIRRORS`] with live mirrors
+/// (window.rs's `ut_set_mirror_focused_writes_and_tolerates_miss` and
+/// event_loop.rs's `live_window_ids_filters_dead_mirrors_...`): they run in
+/// parallel in one test binary and each asserts exact registry contents.
+#[cfg(test)]
+pub(crate) static WINDOW_MIRRORS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Writes the per-window focused bit (#173) through [`WINDOW_MIRRORS`].
+/// A miss (unknown id, or the mirror already unregistered because the
+/// `Window` was dropped) is silently skipped — same tolerance as the
+/// unregister-vs-backfill timing of the other mirror bits. Called by the
+/// event-loop focus arms right after the app-level HAS_FOCUS store.
+pub(crate) fn set_mirror_focused(window_id: i64, focused: bool) {
+  let mirror = WINDOW_MIRRORS
+    .lock()
+    .expect("WINDOW_MIRRORS poisoned")
+    .get(&window_id)
+    .and_then(|weak| weak.upgrade());
+  if let Some(mirror) = mirror {
+    mirror.focused.store(focused, Ordering::Release);
+  }
+}
+
+/// #184 lazy bridge-client cache policy (shared seam for `bridge_client` and
+/// its unit tests). On a cache hit the cached client is cloned; on a miss the
+/// client is re-fetched once through `refetch` (the app handle's
+/// `WindowExt::window()`, a non-blocking RwLock read) and the cache is
+/// overwritten on success so later calls are served from it; a persistent
+/// failure returns `None` with a warn emitted exactly once — gated on the
+/// false→true transition of `warned` (swap-based debounce, so hot paths like
+/// the decoration seed cannot storm the log when the bridge is down).
+///
+/// Generic over the client type: a real `WindowClient` needs a live bridge
+/// session (NAPI) that a test binary does not have, and the policy is what
+/// design D8 specifies; the production call site instantiates
+/// `C = openharmony_ability_plugin_window::WindowClient`.
+fn bridge_client_cached_or_refetch<C: Clone>(
+  cache: &std::sync::Mutex<Option<C>>,
+  refetch: impl FnOnce() -> Option<C>,
+  op: &str,
+  warned: &AtomicBool,
+) -> Option<C> {
+  let cached = cache
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .clone();
+  if cached.is_some() {
+    return cached;
+  }
+  match refetch() {
+    Some(client) => {
+      *cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(client.clone());
+      Some(client)
+    }
+    None => {
+      if !warned.swap(true, Ordering::Relaxed) {
+        log::warn!(
+          "[tao-ohos] {op}: bridge client re-fetch failed — window operations degrade to no-ops (reported once)"
+        );
+      }
+      None
+    }
+  }
+}
 
 /// A deferred window operation waiting for its target's UIAbility stage
 /// handshake (issue 7, doc/OHOS窗口遗留问题.md in the tauri repo): boxed so
@@ -273,8 +347,17 @@ pub(crate) struct Window {
   /// compensation is computed per-window on the ArkTS side from the window's
   /// own `getWindowProperties()` snapshot (Float windows get chrome 0
   /// automatically), so no per-window kind state is needed anymore.
-  /// Bridge facade for async window operations (None when bridge is not ready).
-  window_client: Option<openharmony_ability_plugin_window::WindowClient>,
+  /// Bridge facade for async window operations. Mutex'd (#184): a `None`
+  /// captured at construction (bridge not yet ready during early init) is
+  /// lazily re-fetched on the next `bridge_client` call and overwritten on
+  /// success, instead of pinning the no-op degradation for the window's
+  /// whole lifetime. Direct reads outside `bridge_client` go through
+  /// `cached_client` (lock, clone, drop the guard).
+  window_client: std::sync::Mutex<Option<openharmony_ability_plugin_window::WindowClient>>,
+  /// Warn-once debounce for bridge-client re-fetch failures (#184): the lazy
+  /// re-fetch runs on hot paths (e.g. the decoration seed), so the failure
+  /// warn is emitted only on the false→true transition of this flag.
+  bridge_refetch_warned: AtomicBool,
   /// Background runtime handle for spawning async bridge calls.
   runtime: BridgeExecutor,
   /// Shared state mirror (see [`WindowStateMirror`]): the event loop drain
@@ -724,14 +807,14 @@ impl Window {
     };
 
     // Create the WindowClient bridge facade. If the bridge runtime is not yet
-    // ready (e.g. during early init), window_client = None: that is warned
-    // about once here, and every window operation then degrades to a no-op
-    // with a debug! log (see `bridge_client`).
+    // ready (e.g. during early init), the cache starts None: that is warned
+    // about once here, and later window operations lazily re-fetch through
+    // the app handle (#184) — see `bridge_client`.
     let window_client = match el.app.window() {
       Ok(client) => Some(client),
       Err(e) => {
         log::warn!(
-          "[tao-ohos] window bridge init failed for window {:?}: {:?} — window operations degrade to no-ops",
+          "[tao-ohos] window bridge init failed for window {:?}: {:?} — window operations degrade to no-ops until the bridge is ready",
           window_id, e
         );
         None
@@ -739,7 +822,11 @@ impl Window {
     };
     let runtime = el.bridge_executor.clone();
 
-    let mirror = Arc::new(WindowStateMirror::new());
+    // #173: seed the mirror's per-window focused bit from the app-level
+    // HAS_FOCUS snapshot at registration time — the focus arms only write on
+    // transitions, so without the seed the bit would stay false for a window
+    // created while the app already had focus.
+    let mirror = Arc::new(WindowStateMirror::new(HAS_FOCUS.load(Ordering::Relaxed)));
     // Seed the size-constraint cache from the builder (previously the builder
     // values were ignored — the four slots stayed 0 until a runtime
     // set_min/max_inner_size call): logical → physical via the real scale.
@@ -750,7 +837,8 @@ impl Window {
     let win = Self {
       app: el.app.clone(),
       window_id,
-      window_client,
+      window_client: std::sync::Mutex::new(window_client),
+      bridge_refetch_warned: AtomicBool::new(false),
       runtime,
       mirror: mirror.clone(),
       decorations: AtomicBool::new(window_attrs.decorations),
@@ -789,8 +877,9 @@ impl Window {
     // window_id (not hardcoded 0): a subsequent UIAbility window with
     // decorations(false) must not strip the primary window's decorations.
     if is_ui_ability_window && !window_attrs.decorations {
-      if let Some(ref client) = win.window_client {
-        let client = client.clone();
+      // Lock-then-clone (#184): never hold the window_client lock across the
+      // dispatch.
+      if let Some(client) = win.cached_client() {
         let decorations_window_id = window_id.unwrap_or(0);
         win.spawn_or_queue(async move {
           if let Err(e) = client
@@ -848,15 +937,33 @@ impl Window {
     Ok(win)
   }
 
+  /// Returns the cached bridge client without a re-fetch attempt (#184): for
+  /// direct-read points that must keep their existing None semantics (degrade
+  /// to NotSupported / skip) and must not hold the lock across dispatch.
+  fn cached_client(&self) -> Option<openharmony_ability_plugin_window::WindowClient> {
+    self
+      .window_client
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .clone()
+  }
+
   /// Returns a clone of the bridge client for dispatching an async window
-  /// operation, or `None` when the bridge was not ready at creation time
-  /// (warned once in `new`) — the caller then degrades to a no-op, after a
-  /// debug! log here so the degradation is at least visible in logs.
+  /// operation, lazily re-fetching it through the app handle when the cache
+  /// is empty (#184): a window constructed before the bridge runtime was
+  /// ready used to degrade to no-ops for its whole lifetime; now the next
+  /// operation retries the construction-time `WindowExt::window()` (a
+  /// non-blocking RwLock read + clone) and overwrites the cache on success.
+  /// A persistent failure returns `None` with a warn emitted exactly once
+  /// (see [`bridge_client_cached_or_refetch`]) — the caller then degrades to
+  /// a no-op.
   fn bridge_client(&self, op: &str) -> Option<openharmony_ability_plugin_window::WindowClient> {
-    self.window_client.clone().or_else(|| {
-      log::debug!("[tao-ohos] {op} skipped: bridge not ready (WindowClient is None)");
-      None
-    })
+    bridge_client_cached_or_refetch(
+      &self.window_client,
+      || self.app.window().ok(),
+      op,
+      &self.bridge_refetch_warned,
+    )
   }
 
   /// Dispatch a window op to the bridge executor, or queue it if the target
@@ -1255,21 +1362,27 @@ impl Window {
 
   pub fn set_focusable(&self, focusable: bool) {
     if let Some(window_id) = self.window_id {
-      if window_id > 0 {
-        let Some(client) = self.bridge_client("set_focusable") else {
-          return;
-        };
-        self.spawn_or_queue(async move {
-          if let Err(e) = client.set_window_focusable(window_id, focusable).await {
-            log::warn!(
-              "set_focusable: set_window_focusable failed for window {}: {:?}",
-              window_id,
-              e
-            );
-          }
-        });
-      }
-      // Main window (window_id = 0): focusable is OS-managed, no-op
+      // #174 (2026-10-21 device arbitration): the `window_id > 0` gate that
+      // historically no-op'd the main window is removed — the main window
+      // (id 0) dispatches through the same bridge path as Float sub-windows.
+      // The OS arbitrates: `win.setFocusable` (WindowPlugin.ets set-focusable
+      // action) succeeds on the main window (probe evidence in the phase
+      // report); a rejection surfaces as the structured warn below. The
+      // bridge action bypasses WindowManager.setWindowFocusable (dead code),
+      // so the facade-level judging observable is the Rust-side warn, not
+      // the WindowManager hilog.debug success line.
+      let Some(client) = self.bridge_client("set_focusable") else {
+        return;
+      };
+      self.spawn_or_queue(async move {
+        if let Err(e) = client.set_window_focusable(window_id, focusable).await {
+          log::warn!(
+            "set_focusable: set_window_focusable failed for window {}: {:?}",
+            window_id,
+            e
+          );
+        }
+      });
     }
   }
 
@@ -1668,8 +1781,8 @@ impl Window {
     let window_id = self
       .window_id
       .ok_or_else(|| error::ExternalError::NotSupported(error::NotSupportedError::new()))?;
-    let client = match &self.window_client {
-      Some(c) => c.clone(),
+    let client = match self.cached_client() {
+      Some(c) => c,
       None => {
         log::warn!(
           "[tao-ohos] set_cursor_grab: WindowClient not initialized for window {}",
@@ -1793,8 +1906,9 @@ impl Window {
     // Tauri `ignore=true` (pass events through to windows below) ↔ OHOS `touchable=false`
     // (window does not consume touch/mouse events). The negation lives in this tao layer;
     // the facade client passes `touchable` through verbatim. See design D4 mapping table.
-    if let Some(ref client) = self.window_client {
-      let client = client.clone();
+    // Lock-then-clone (#184): never hold the window_client lock across the
+    // dispatch.
+    if let Some(client) = self.cached_client() {
       self.spawn_or_queue(async move {
         if let Err(e) = client.set_window_touchable(window_id, !ignore).await {
           warn!(
@@ -2246,6 +2360,166 @@ mod tests {
       "dropped entry not removed"
     );
     openharmony_ability::unregister_pending_ui_ability(DROPPED_ID);
+  }
+
+  // --- #184: lazy bridge-client re-fetch policy (design D8). The helper is
+  // generic over the client type because a real WindowClient needs a live
+  // bridge session (NAPI) that a test binary does not have; the policy under
+  // test is hit / miss-overwrite / warn-once-debounce, and the production
+  // call site instantiates C = WindowClient.
+
+  #[derive(Clone, PartialEq, Debug)]
+  struct DummyClient(u32);
+
+  /// UT for #184: a cache hit must clone the cached client and never touch
+  /// the re-fetch path (no warn either).
+  #[test]
+  fn ut_bridge_client_hit_skips_refetch() {
+    let cache: std::sync::Mutex<Option<DummyClient>> = std::sync::Mutex::new(Some(DummyClient(7)));
+    let warned = AtomicBool::new(false);
+    let refetched = Arc::new(AtomicBool::new(false));
+    let flag = refetched.clone();
+    let got = bridge_client_cached_or_refetch(
+      &cache,
+      move || {
+        flag.store(true, Ordering::SeqCst);
+        Some(DummyClient(99))
+      },
+      "ut-op",
+      &warned,
+    );
+    assert_eq!(got, Some(DummyClient(7)));
+    assert!(!refetched.load(Ordering::SeqCst), "cache hit re-fetched");
+    assert!(!warned.load(Ordering::SeqCst), "cache hit tripped the warn");
+  }
+
+  /// UT for #184: a cache miss re-fetches through the app handle once and
+  /// overwrites the cache, so the next call is served from the cache without
+  /// a second re-fetch; success must not trip the warn debounce.
+  #[test]
+  fn ut_bridge_client_miss_refetches_and_overwrites_cache() {
+    let cache: std::sync::Mutex<Option<DummyClient>> = std::sync::Mutex::new(None);
+    let warned = AtomicBool::new(false);
+    let calls = Arc::new(AtomicU32::new(0));
+    let counter = calls.clone();
+    let got = bridge_client_cached_or_refetch(
+      &cache,
+      move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Some(DummyClient(5))
+      },
+      "ut-op",
+      &warned,
+    );
+    assert_eq!(got, Some(DummyClient(5)));
+    assert_eq!(
+      calls.load(Ordering::SeqCst),
+      1,
+      "re-fetch ran more than once"
+    );
+    let counter = calls.clone();
+    let got2 = bridge_client_cached_or_refetch(
+      &cache,
+      move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Some(DummyClient(6))
+      },
+      "ut-op",
+      &warned,
+    );
+    assert_eq!(got2, Some(DummyClient(5)), "overwritten cache not served");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "second call re-fetched");
+    assert!(
+      !warned.load(Ordering::SeqCst),
+      "successful re-fetch tripped the warn debounce"
+    );
+  }
+
+  /// UT for #184: a persistent re-fetch failure returns None with the warn
+  /// debounce tripping exactly once — the flag flips false→true on the first
+  /// failure and holds on subsequent failures. Warn emission is gated 1:1 on
+  /// that false→true transition (asserted by the reset leg below), so
+  /// consecutive failures with a fresh flag can never emit a second warn.
+  #[test]
+  fn ut_bridge_client_refetch_failure_returns_none_and_warns_once() {
+    let cache: std::sync::Mutex<Option<DummyClient>> = std::sync::Mutex::new(None);
+    let warned = AtomicBool::new(false);
+    // Bridge stays unavailable: app.window() errors → mapped to None here.
+    let refetch = || None::<DummyClient>;
+    assert_eq!(
+      bridge_client_cached_or_refetch(&cache, refetch, "ut-op", &warned),
+      None
+    );
+    assert!(
+      warned.load(Ordering::SeqCst),
+      "first failure did not trip the warn debounce"
+    );
+    assert_eq!(
+      bridge_client_cached_or_refetch(&cache, refetch, "ut-op", &warned),
+      None
+    );
+    assert!(
+      warned.load(Ordering::SeqCst),
+      "debounce flag must hold across consecutive failures"
+    );
+    warned.store(false, Ordering::SeqCst);
+    assert_eq!(
+      bridge_client_cached_or_refetch(&cache, refetch, "ut-op", &warned),
+      None
+    );
+    assert!(
+      warned.load(Ordering::SeqCst),
+      "warn is not gated on the false→true transition of the debounce flag"
+    );
+  }
+
+  // --- #173: per-window focused bit on the state mirror (design D7). The
+  // app-level HAS_FOCUS static stays the is_focused() source; the mirror bit
+  // only records per-window system truth for the event-loop drain.
+
+  /// UT for #173: WindowStateMirror::new seeds the focused bit from the
+  /// HAS_FOCUS snapshot taken at mirror registration time.
+  #[test]
+  fn ut_window_state_mirror_seeds_focused_bit() {
+    assert!(
+      WindowStateMirror::new(true).focused.load(Ordering::SeqCst),
+      "new(true) must seed focused"
+    );
+    assert!(
+      !WindowStateMirror::new(false).focused.load(Ordering::SeqCst),
+      "new(false) must seed unfocused"
+    );
+  }
+
+  /// UT for #173: set_mirror_focused writes the registered mirror through
+  /// WINDOW_MIRRORS, and tolerates a miss (unknown id / already-dropped
+  /// window Weak) without panicking — event-loop focus arms must never fail
+  /// on a mirror that went away.
+  #[test]
+  fn ut_set_mirror_focused_writes_and_tolerates_miss() {
+    // Exact-contents coexistence with event_loop.rs's live_window_ids test.
+    let _guard = WINDOW_MIRRORS_TEST_LOCK
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
+    const SENTINEL: i64 = i64::MAX - 3;
+    let mirror = Arc::new(WindowStateMirror::new(false));
+    WINDOW_MIRRORS
+      .lock()
+      .expect("WINDOW_MIRRORS poisoned")
+      .insert(SENTINEL, Arc::downgrade(&mirror));
+    set_mirror_focused(SENTINEL, true);
+    assert!(mirror.focused.load(Ordering::SeqCst));
+    set_mirror_focused(SENTINEL, false);
+    assert!(!mirror.focused.load(Ordering::SeqCst));
+    // Unknown id: silently skipped.
+    set_mirror_focused(i64::MIN, true);
+    // Dropped window (Weak::upgrade fails): silently skipped.
+    drop(mirror);
+    set_mirror_focused(SENTINEL, true);
+    WINDOW_MIRRORS
+      .lock()
+      .expect("WINDOW_MIRRORS poisoned")
+      .remove(&SENTINEL);
   }
 }
 

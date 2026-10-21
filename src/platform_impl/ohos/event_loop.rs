@@ -733,6 +733,9 @@ impl<T: 'static> EventLoop<T> {
     window_id: i64,
   ) {
     HAS_FOCUS.store(true, Ordering::Relaxed);
+    // #173: mirror the per-window focused bit through WINDOW_MIRRORS (miss
+    // tolerated — the window may have dropped between event and write).
+    super::window::set_mirror_focused(window_id, true);
     // Modifier state is tracked from key events (issue #109); a window
     // that regained focus may have missed modifier releases while
     // unfocused — start clean rather than trust a stale set.
@@ -1060,6 +1063,9 @@ impl<T: 'static> EventLoop<T> {
           // field — including on not-yet-refocused windows; the next
           // focus gainer is the correction point.
           HAS_FOCUS.store(false, Ordering::Relaxed);
+          // #173: mirror the per-window focused bit (miss tolerated — same
+          // unregister-vs-backfill timing as the other mirror bits).
+          super::window::set_mirror_focused(window_id, false);
           call_event_handler!(
             event_loop_cell,
             event::Event::WindowEvent {
@@ -2000,6 +2006,10 @@ mod live_window_ids_tests {
 
   #[test]
   fn live_window_ids_filters_dead_mirrors_and_falls_back_to_window_zero() {
+    // Exact-contents coexistence with window.rs's set_mirror_focused test.
+    let _guard = super::super::window::WINDOW_MIRRORS_TEST_LOCK
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner());
     const LIVE: i64 = i64::MAX - 11;
     const DEAD: i64 = i64::MAX - 12;
     // The strong ref keeps LIVE's mirror alive; DEAD is a Weak with no
@@ -2009,10 +2019,15 @@ mod live_window_ids_tests {
       fullscreen: std::sync::atomic::AtomicBool::new(false),
       maximized: std::sync::atomic::AtomicBool::new(false),
       minimized: std::sync::atomic::AtomicBool::new(false),
+      focused: std::sync::atomic::AtomicBool::new(false),
     });
     {
+      // Keyed removal, not a whole-registry clear: window.rs's mirror test
+      // registers its own sentinel entry in WINDOW_MIRRORS, and these tests
+      // run in parallel — only this test's own keys may be touched.
       let mut mirrors = WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned");
-      mirrors.clear();
+      mirrors.remove(&LIVE);
+      mirrors.remove(&DEAD);
       mirrors.insert(LIVE, Arc::downgrade(&live_state));
       mirrors.insert(DEAD, std::sync::Weak::new());
     }
@@ -2022,11 +2037,12 @@ mod live_window_ids_tests {
     // mirrors left the broadcast falls back to the main window.
     drop(live_state);
     assert_eq!(live_window_ids(), vec![0]);
-    // Empty registry (pre-first-window phase): same fallback.
+    // Empty registry (pre-first-window phase): same fallback. Keyed removal
+    // again — foreign sentinel entries (window.rs mirror test) stay put.
     WINDOW_MIRRORS
       .lock()
       .expect("WINDOW_MIRRORS poisoned")
-      .clear();
+      .remove(&LIVE);
     assert_eq!(live_window_ids(), vec![0]);
   }
 }
