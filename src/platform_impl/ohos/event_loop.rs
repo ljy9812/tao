@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -45,6 +45,39 @@ const EFFECTIVE_THEME_LIGHT: u8 = 0;
 const EFFECTIVE_THEME_DARK: u8 = 1;
 const EFFECTIVE_THEME_UNSEEDED: u8 = 2;
 static LAST_EFFECTIVE_THEME: AtomicU8 = AtomicU8::new(EFFECTIVE_THEME_UNSEEDED);
+
+/// #180① (design D7): the window id currently recorded as focused — the
+/// shared change-edge snapshot for BOTH focus sources (FloatPage
+/// `windowEvent` WINDOW_ACTIVE/WINDOW_INACTIVE edges drained via
+/// `drain_pending_window_focus`, and the per-UIAbility stage
+/// GainedFocus/LostFocus arms). 0 = none. The edge rules built on it:
+/// a gain edge (focused=true, last≠W) pairs-clears the previous holder
+/// before the gain; a loss edge only applies when W is the recorded holder;
+/// same-state duplicate edges are swallowed (zero WindowEvents). Written by
+/// `handle_gained_focus` (gain → window id) and the stage LostFocus arm
+/// (loss → 0) so cross-path duplicate edges dedup the same way. Read and
+/// written from the single-threaded run_loop dispatch only — Relaxed matches
+/// the HAS_FOCUS discipline.
+static LAST_FOCUSED_WINDOW_ID: AtomicI64 = AtomicI64::new(0);
+
+/// #180 (design D8): the last scale factor forwarded as
+/// `ScaleFactorChanged`, stored as `f64::to_bits` (NaN-safe bitwise
+/// comparison). Bitwise-equal repeats are swallowed; the first event forwards
+/// (0-bits is not a representable scale, so the initial value reads as
+/// unseeded). Mirrors the ThemeChanged edge detection
+/// ([`LAST_EFFECTIVE_THEME`]) — the two guards are independent and must not
+/// interact.
+static LAST_EFFECTIVE_SCALE: AtomicU64 = AtomicU64::new(0);
+
+/// #180 (design D8): the ThemeChanged-style edge detector for scale factors —
+/// returns `true` when the event must forward (first event or a real bitwise
+/// change) and updates the snapshot; `false` swallows the repeat. Extracted
+/// so the UT can drive the exact production guard.
+fn scale_should_forward(new_scale: f64) -> bool {
+  let bits = new_scale.to_bits();
+  let prev = LAST_EFFECTIVE_SCALE.swap(bits, Ordering::Relaxed);
+  prev != bits
+}
 
 /// Last dispatched rect per OHOS window id — (outer left, outer top, INNER
 /// width, inner height; review R11) — used to split windowRectChange events
@@ -736,6 +769,10 @@ impl<T: 'static> EventLoop<T> {
     // #173: mirror the per-window focused bit through WINDOW_MIRRORS (miss
     // tolerated — the window may have dropped between event and write).
     super::window::set_mirror_focused(window_id, true);
+    // #180① (design D7): sync the shared change-edge snapshot so the Float
+    // drain path and this stage path dedup duplicate edges against the same
+    // record (cross-path repeats are swallowed the same way).
+    LAST_FOCUSED_WINDOW_ID.store(window_id, Ordering::Relaxed);
     // Modifier state is tracked from key events (issue #109); a window
     // that regained focus may have missed modifier releases while
     // unfocused — start clean rather than trust a stale set.
@@ -796,6 +833,75 @@ impl<T: 'static> EventLoop<T> {
         event: event::WindowEvent::Focused(true),
       }
     );
+  }
+
+  /// #180① (design D7): the single blur write face — per-window mirror bit
+  /// (#173 write face) + the `Focused(false)` event. Shared by the stage
+  /// LostFocus arm (which additionally clears the app-level HAS_FOCUS bit)
+  /// and the Float drain's paired-blur synthesis (which must NOT touch
+  /// HAS_FOCUS — the ability may still hold focus, and the pair is completed
+  /// by the immediately following gain on the new window). Extracted so the
+  /// two callers cannot drift.
+  fn apply_blur(
+    event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>,
+    window_id: i64,
+  ) {
+    // #173: mirror the per-window focused bit (miss tolerated — same
+    // unregister-vs-backfill timing as the other mirror bits).
+    super::window::set_mirror_focused(window_id, false);
+    call_event_handler!(
+      event_loop_cell,
+      event::Event::WindowEvent {
+        window_id: window::WindowId(WindowId(window_id)),
+        event: event::WindowEvent::Focused(false),
+      }
+    );
+  }
+
+  /// #180① (design D7): consume one drained `notify_window_focus` edge
+  /// (FloatPage windowEvent WINDOW_ACTIVE/WINDOW_INACTIVE) with change-edge
+  /// dedup against [`LAST_FOCUSED_WINDOW_ID`] plus paired-blur synthesis:
+  ///
+  /// - gain edge (`focused=true`, last≠W): first pair-clear the previous
+  ///   holder P=last (mirror bit + `Focused(false)`) — ONLY when P still
+  ///   reports `focused=true` (a holder already blurred by a real stage event
+  ///   must not be double-blurred) — then the regular gain path
+  ///   ([`Self::handle_gained_focus`], which also syncs the snapshot).
+  /// - loss edge (`focused=false`, last==W): the blur write face + snapshot
+  ///   → 0. HAS_FOCUS is deliberately NOT touched (see [`Self::apply_blur`]
+  ///   note): only stage events maintain the app-level bit.
+  /// - same-state edges (`focused=true` && last==W; `focused=false` &&
+  ///   last≠W): swallowed — zero WindowEvents, zero mirror writes.
+  fn handle_pending_window_focus(
+    event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>,
+    window_id: i64,
+    focused: bool,
+  ) {
+    let last = LAST_FOCUSED_WINDOW_ID.load(Ordering::Relaxed);
+    if focused {
+      if last == window_id {
+        // Duplicate gain edge (e.g. ArkTS re-reporting WINDOW_ACTIVE for the
+        // window it already recorded as focused) — swallow.
+        return;
+      }
+      // Pair semantics: the previous holder must not keep a stale focused bit
+      // when ArkTS fast-switches and only reports the new ACTIVE (no
+      // INACTIVE for P). Gate on the mirror bit so an already-blurred holder
+      // is not double-blurred.
+      if last != 0 && super::window::mirror_focused_bit(last) {
+        Self::apply_blur(event_loop_cell, last);
+      }
+      Self::handle_gained_focus(event_loop_cell, window_id);
+    } else {
+      if last != window_id {
+        // Stale/unknown blur edge: the recorded holder is someone else (or
+        // nothing) — swallow so a replayed INACTIVE cannot blur a window
+        // that legitimately holds focus now.
+        return;
+      }
+      Self::apply_blur(event_loop_cell, window_id);
+      LAST_FOCUSED_WINDOW_ID.store(0, Ordering::Relaxed);
+    }
   }
 
   pub fn run<F>(self, event_handler: F) -> ()
@@ -913,6 +1019,14 @@ impl<T: 'static> EventLoop<T> {
             }
           }
         }
+      }
+
+      // #180① (design D7): Float sub-window focus edges (FloatPage windowEvent
+      // WINDOW_ACTIVE/WINDOW_INACTIVE → notifyWindowFocus) drain next to the
+      // status backfill and run through the same change-edge dedup +
+      // paired-blur synthesis the stage arms share.
+      for (focus_window_id, focused) in openharmony_ability::drain_pending_window_focus() {
+        Self::handle_pending_window_focus(&event_loop_cell, focus_window_id, focused);
       }
 
       // Issue 7: replay window ops queued against spawned UIAbility windows
@@ -1063,16 +1177,12 @@ impl<T: 'static> EventLoop<T> {
           // field — including on not-yet-refocused windows; the next
           // focus gainer is the correction point.
           HAS_FOCUS.store(false, Ordering::Relaxed);
-          // #173: mirror the per-window focused bit (miss tolerated — same
-          // unregister-vs-backfill timing as the other mirror bits).
-          super::window::set_mirror_focused(window_id, false);
-          call_event_handler!(
-            event_loop_cell,
-            event::Event::WindowEvent {
-              window_id: window::WindowId(WindowId(window_id)),
-              event: event::WindowEvent::Focused(false),
-            }
-          );
+          // #180① (design D7): the blur write face is shared with the Float
+          // drain's paired-blur synthesis (apply_blur), and the shared
+          // change-edge snapshot records the holder clearing so cross-path
+          // duplicate edges dedup the same way.
+          Self::apply_blur(&event_loop_cell, window_id);
+          LAST_FOCUSED_WINDOW_ID.store(0, Ordering::Relaxed);
         }
         MainEvent::ConfigChanged { .. } => {
           // Configuration changes are app-level (EnvironmentCallback), not tied to a
@@ -1090,26 +1200,33 @@ impl<T: 'static> EventLoop<T> {
           // first readable windowRectChange, so fall back to the app-level
           // content rect then (the same pre-geometry degradation the Resized
           // path tolerates).
+          // #180 (design D8): the broadcast is edge-guarded — a bitwise-equal
+          // scale repeat (ConfigChanged storms that leave scale untouched)
+          // forwards nothing, first event forwards (0-bits reads as
+          // unseeded). Mirrors the ThemeChanged guard below; the two edge
+          // detectors are independent.
           let scale = app.scale();
-          let app_rect = app.content_rect();
-          for wid in live_window_ids() {
-            let inner = app.inner_rect_for(wid);
-            let (width, height) = if inner.width > 0 && inner.height > 0 {
-              (inner.width, inner.height)
-            } else {
-              (app_rect.width, app_rect.height)
-            };
-            let mut size = PhysicalSize::new(width as _, height as _);
-            call_event_handler!(
-              event_loop_cell,
-              event::Event::WindowEvent {
-                window_id: window::WindowId(WindowId(wid)),
-                event: event::WindowEvent::ScaleFactorChanged {
-                  new_inner_size: &mut size,
-                  scale_factor: scale as _,
-                },
-              }
-            );
+          if scale_should_forward(scale as f64) {
+            let app_rect = app.content_rect();
+            for wid in live_window_ids() {
+              let inner = app.inner_rect_for(wid);
+              let (width, height) = if inner.width > 0 && inner.height > 0 {
+                (inner.width, inner.height)
+              } else {
+                (app_rect.width, app_rect.height)
+              };
+              let mut size = PhysicalSize::new(width as _, height as _);
+              call_event_handler!(
+                event_loop_cell,
+                event::Event::WindowEvent {
+                  window_id: window::WindowId(WindowId(wid)),
+                  event: event::WindowEvent::ScaleFactorChanged {
+                    new_inner_size: &mut size,
+                    scale_factor: scale as _,
+                  },
+                }
+              );
+            }
           }
           // Issue Eulogizethesun/tauri#108: onConfigurationUpdate → ConfigChanged
           // carries the new colorMode (app.config() is already updated by the
@@ -2044,5 +2161,259 @@ mod live_window_ids_tests {
       .expect("WINDOW_MIRRORS poisoned")
       .remove(&LIVE);
     assert_eq!(live_window_ids(), vec![0]);
+  }
+}
+
+/// #180①/#180 coverage for the focus edge consumption (`design D7`) and the
+/// scale broadcast dedup (`design D8`). The sentinel ids sit far above any
+/// real OHOS window id and above the other test modules' sentinels; the
+/// WINDOW_MIRRORS_TEST_LOCK serializes with the mirror-registry tests, and
+/// every global the tests touch (HAS_FOCUS / LAST_FOCUSED_WINDOW_ID /
+/// LAST_EFFECTIVE_SCALE / the mirrors) is saved and restored so a parallel
+/// test cannot inherit our state.
+#[cfg(test)]
+mod focus_scale_tests {
+  use super::*;
+  use super::super::window::{WindowStateMirror, WINDOW_MIRRORS_TEST_LOCK};
+
+  type LoopCell<T> = Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>;
+
+  /// Compact descriptor of the focus-relevant events one handler invocation
+  /// emitted: `"focus:<window id>:<bool>"` per Focused event.
+  fn run_collected<T: 'static>(invoke: impl FnOnce(&LoopCell<T>)) -> Vec<String> {
+    let out: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = out.clone();
+    let cell: LoopCell<T> = Arc::new(RefCell::new(Some(Box::new(move |e: event::Event<T>| {
+      if let event::Event::WindowEvent {
+        window_id: window::WindowId(WindowId(id)),
+        event: event::WindowEvent::Focused(focused),
+      } = e
+      {
+        sink
+          .lock()
+          .expect("focus sink poisoned")
+          .push(format!("focus:{id}:{focused}"));
+      }
+    }))));
+    invoke(&cell);
+    let collected = out.lock().expect("focus sink poisoned").clone();
+    collected
+  }
+
+  /// Registers a live mirror for `window_id` with the given focused seed and
+  /// returns the strong ref that keeps it alive.
+  fn register_mirror(window_id: i64, focused: bool) -> Arc<WindowStateMirror> {
+    let mirror = Arc::new(WindowStateMirror::new(focused));
+    WINDOW_MIRRORS
+      .lock()
+      .expect("WINDOW_MIRRORS poisoned")
+      .insert(window_id, Arc::downgrade(&mirror));
+    mirror
+  }
+
+  fn set_last_focused(window_id: i64) {
+    LAST_FOCUSED_WINDOW_ID.store(window_id, Ordering::Relaxed);
+  }
+
+  fn last_focused() -> i64 {
+    LAST_FOCUSED_WINDOW_ID.load(Ordering::Relaxed)
+  }
+
+  /// UT for #180① ① (design D7): a first Float gain edge forwards
+  /// Focused(true); a gain edge over a still-focused previous holder
+  /// pair-clears it first (mirror bit + synthesized Focused(false)) — the
+  /// paired semantics that keep ArkTS fast-switches (ACTIVE without a
+  /// matching INACTIVE) from leaving a stale focused bit.
+  #[test]
+  fn ut_focus_drain_gain_edge_forwards_and_pairs_blur() {
+    let _guard = WINDOW_MIRRORS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    const PREV: i64 = i64::MAX - 21;
+    const NEW: i64 = i64::MAX - 22;
+    let has_focus_before = HAS_FOCUS.load(Ordering::Relaxed);
+    let prev_mirror = register_mirror(PREV, true);
+    let new_mirror = register_mirror(NEW, false);
+    set_last_focused(PREV);
+    if let Ok(mut m) = KEYBOARD_MODIFIERS.lock() {
+      *m = ModifiersState::empty();
+    }
+
+    // First gain for NEW over the still-focused PREV: paired blur on PREV,
+    // then the regular gain on NEW.
+    let events = run_collected::<()>(|cell| {
+      EventLoop::<()>::handle_pending_window_focus(cell, NEW, true);
+    });
+    assert_eq!(
+      events,
+      vec![
+        format!("focus:{PREV}:false"),
+        format!("focus:{NEW}:true")
+      ],
+      "gain edge must pair-clear the previous holder before the gain"
+    );
+    assert!(!prev_mirror.focused.load(Ordering::SeqCst), "paired blur did not clear PREV's focused bit");
+    assert!(new_mirror.focused.load(Ordering::SeqCst), "gain did not set NEW's focused bit");
+    assert_eq!(last_focused(), NEW, "gain edge must sync the shared snapshot");
+
+    HAS_FOCUS.store(has_focus_before, Ordering::Relaxed);
+    set_last_focused(0);
+    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&PREV);
+    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&NEW);
+  }
+
+  /// UT for #180① ② (design D7): a same-window same-state gain edge is
+  /// swallowed — zero WindowEvents, zero mirror writes, snapshot unchanged.
+  #[test]
+  fn ut_focus_drain_duplicate_gain_edge_is_swallowed() {
+    let _guard = WINDOW_MIRRORS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    const W: i64 = i64::MAX - 22;
+    let has_focus_before = HAS_FOCUS.load(Ordering::Relaxed);
+    let mirror = register_mirror(W, true);
+    set_last_focused(W);
+    if let Ok(mut m) = KEYBOARD_MODIFIERS.lock() {
+      *m = ModifiersState::empty();
+    }
+
+    let events = run_collected::<()>(|cell| {
+      EventLoop::<()>::handle_pending_window_focus(cell, W, true);
+    });
+    assert!(events.is_empty(), "duplicate gain edge must emit nothing");
+    assert!(mirror.focused.load(Ordering::SeqCst), "swallowed edge must not touch the mirror");
+    assert_eq!(last_focused(), W, "swallowed edge must not move the snapshot");
+
+    HAS_FOCUS.store(has_focus_before, Ordering::Relaxed);
+    set_last_focused(0);
+    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&W);
+  }
+
+  /// UT for #180① (design D7 loss edge): a loss edge applies only when the
+  /// window is the recorded holder (blur write face + snapshot → 0); a
+  /// repeat loss edge for a window that is no longer the holder is
+  /// swallowed. HAS_FOCUS stays untouched by the drain path (stage events
+  /// own the app-level bit).
+  #[test]
+  fn ut_focus_drain_loss_edge_applies_only_to_recorded_holder() {
+    let _guard = WINDOW_MIRRORS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    const W: i64 = i64::MAX - 23;
+    const OTHER: i64 = i64::MAX - 24;
+    let has_focus_before = HAS_FOCUS.load(Ordering::Relaxed);
+    let mirror = register_mirror(W, true);
+    let other_mirror = register_mirror(OTHER, false);
+    set_last_focused(W);
+    HAS_FOCUS.store(true, Ordering::Relaxed);
+
+    // Stale blur for a non-holder: swallowed.
+    let events = run_collected::<()>(|cell| {
+      EventLoop::<()>::handle_pending_window_focus(cell, OTHER, false);
+    });
+    assert!(events.is_empty(), "blur for a non-holder must be swallowed");
+    assert!(mirror.focused.load(Ordering::SeqCst), "swallowed blur must not touch the holder");
+    assert_eq!(last_focused(), W, "swallowed blur must not clear the snapshot");
+
+    // Holder blur: the blur write face + snapshot → 0; HAS_FOCUS untouched.
+    let events = run_collected::<()>(|cell| {
+      EventLoop::<()>::handle_pending_window_focus(cell, W, false);
+    });
+    assert_eq!(events, vec![format!("focus:{W}:false")], "holder blur must dispatch Focused(false)");
+    assert!(!mirror.focused.load(Ordering::SeqCst), "holder blur did not clear the focused bit");
+    assert_eq!(last_focused(), 0, "holder blur must clear the snapshot");
+    assert!(HAS_FOCUS.load(Ordering::Relaxed), "drain blur must not touch the app-level HAS_FOCUS");
+
+    // Repeat blur now finds no holder: swallowed.
+    let events = run_collected::<()>(|cell| {
+      EventLoop::<()>::handle_pending_window_focus(cell, W, false);
+    });
+    assert!(events.is_empty(), "repeat blur with no holder must be swallowed");
+    assert!(!other_mirror.focused.load(Ordering::SeqCst));
+
+    HAS_FOCUS.store(has_focus_before, Ordering::Relaxed);
+    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&W);
+    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&OTHER);
+  }
+
+  /// UT for #180① ③ (design D7): the stage path and the Float drain share
+  /// LAST_FOCUSED_WINDOW_ID — a stage gain (handle_gained_focus) syncs the
+  /// snapshot the drain dedups against, so a cross-path duplicate gain edge
+  /// for the same window is swallowed, while a Float gain over the
+  /// stage-focused window still pair-clears it.
+  #[test]
+  fn ut_focus_stage_and_float_share_edge_snapshot() {
+    let _guard = WINDOW_MIRRORS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    const STAGE: i64 = i64::MAX - 21;
+    const FLOAT: i64 = i64::MAX - 22;
+    let has_focus_before = HAS_FOCUS.load(Ordering::Relaxed);
+    let stage_mirror = register_mirror(STAGE, false);
+    let float_mirror = register_mirror(FLOAT, false);
+    if let Ok(mut m) = KEYBOARD_MODIFIERS.lock() {
+      *m = ModifiersState::empty();
+    }
+
+    // Stage gain (UIAbility ACTIVE): forwards and syncs the snapshot.
+    let events = run_collected::<()>(|cell| {
+      EventLoop::<()>::handle_gained_focus(cell, STAGE);
+    });
+    assert_eq!(events, vec![format!("focus:{STAGE}:true")], "stage gain must forward Focused(true)");
+    assert_eq!(last_focused(), STAGE, "stage gain must sync the shared snapshot");
+    assert!(stage_mirror.focused.load(Ordering::SeqCst));
+
+    // Cross-path duplicate: a Float drain gain for the same window (already
+    // recorded by the stage path) is swallowed.
+    let events = run_collected::<()>(|cell| {
+      EventLoop::<()>::handle_pending_window_focus(cell, STAGE, true);
+    });
+    assert!(events.is_empty(), "cross-path duplicate gain must be swallowed");
+
+    // Float gain over the stage-focused window: paired blur on STAGE first.
+    let events = run_collected::<()>(|cell| {
+      EventLoop::<()>::handle_pending_window_focus(cell, FLOAT, true);
+    });
+    assert_eq!(
+      events,
+      vec![
+        format!("focus:{STAGE}:false"),
+        format!("focus:{FLOAT}:true")
+      ],
+      "Float gain over the stage holder must pair-clear it first"
+    );
+    assert!(!stage_mirror.focused.load(Ordering::SeqCst));
+    assert!(float_mirror.focused.load(Ordering::SeqCst));
+
+    HAS_FOCUS.store(has_focus_before, Ordering::Relaxed);
+    set_last_focused(0);
+    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&STAGE);
+    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&FLOAT);
+  }
+
+  /// UT for #180 (design D8): the same scale value forwarded repeatedly
+  /// forwards exactly once — the first event seeds/forwards, bitwise-equal
+  /// repeats are swallowed, and a real change forwards again. Also asserts
+  /// the ThemeChanged guard's independence: deduping scale never touches
+  /// LAST_EFFECTIVE_THEME and vice versa.
+  #[test]
+  fn ut_scale_dedup_forwards_change_once_and_swallows_repeats() {
+    let scale_before = LAST_EFFECTIVE_SCALE.swap(0, Ordering::Relaxed);
+    let theme_before = LAST_EFFECTIVE_THEME.load(Ordering::Relaxed);
+
+    // First event (unseeded 0-bits) forwards.
+    assert!(scale_should_forward(1.5), "first scale event must forward");
+    // Three repeats of the same value: one repeat would be the "same value 3
+    // sends" — all three are swallowed (the single forward above is the one).
+    assert!(!scale_should_forward(1.5), "repeat #1 must be swallowed");
+    assert!(!scale_should_forward(1.5), "repeat #2 must be swallowed");
+    assert!(!scale_should_forward(1.5), "repeat #3 must be swallowed");
+    // A real change forwards again.
+    assert!(scale_should_forward(2.0), "a changed scale must forward");
+    assert!(!scale_should_forward(2.0), "repeat after the change must be swallowed");
+    // A different value whose f64 bits differ forwards even at a tiny delta.
+    assert!(scale_should_forward(2.0 + f64::EPSILON), "bitwise change must forward");
+
+    // Theme independence: scale dedup left the theme snapshot untouched, and
+    // a theme value still passes through its own guard.
+    assert_eq!(
+      LAST_EFFECTIVE_THEME.load(Ordering::Relaxed),
+      theme_before,
+      "scale dedup must not touch the theme snapshot"
+    );
+
+    LAST_EFFECTIVE_SCALE.store(scale_before, Ordering::Relaxed);
   }
 }

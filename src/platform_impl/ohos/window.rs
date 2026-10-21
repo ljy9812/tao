@@ -113,7 +113,7 @@ pub(crate) struct WindowStateMirror {
 }
 
 impl WindowStateMirror {
-  fn new(focused: bool) -> Self {
+  pub(crate) fn new(focused: bool) -> Self {
     Self {
       visible: AtomicBool::new(true),
       fullscreen: AtomicBool::new(false),
@@ -202,6 +202,20 @@ pub(crate) fn set_mirror_focused(window_id: i64, focused: bool) {
   if let Some(mirror) = mirror {
     mirror.focused.store(focused, Ordering::Release);
   }
+}
+
+/// #180① (design D7): reads the per-window focused bit through
+/// [`WINDOW_MIRRORS`] — the drain's paired-blur synthesis gates on it
+/// ("P 仍标记 focused=true" per the focus-state spec) so a holder whose bit
+/// was already cleared by a real stage blur is not double-blurred. An unknown
+/// or dropped mirror reads `false` (nothing to pair-clear).
+pub(crate) fn mirror_focused_bit(window_id: i64) -> bool {
+  WINDOW_MIRRORS
+    .lock()
+    .expect("WINDOW_MIRRORS poisoned")
+    .get(&window_id)
+    .and_then(|weak| weak.upgrade())
+    .is_some_and(|mirror| mirror.focused.load(Ordering::Acquire))
 }
 
 /// #184 lazy bridge-client cache policy (shared seam for `bridge_client` and
@@ -335,6 +349,55 @@ pub(crate) fn drop_pending_window_ops(window_id: i64) {
       ops.len(),
       window_id
     );
+  }
+}
+
+/// #168 (design D1): the enqueue/dispatch body of [`Window::dispatch_or_queue`],
+/// extracted as a free function so the creation-attr seeding path and the UTs
+/// exercise the exact production mechanic: ready → run inline (no queue
+/// entry), not-ready → hold in [`PENDING_WINDOW_OPS`] until
+/// [`drain_ready_pending_window_ops`] replays it. A `Window` cannot be
+/// constructed outside a bridge session, so the UT drives this entry point
+/// directly with sentinel ids (same discipline as the O10-6 queue test).
+pub(crate) fn dispatch_or_queue_op(window_id: i64, op: PendingWindowOp) {
+  if openharmony_ability::is_window_ready(window_id) {
+    op();
+    return;
+  }
+  // Push-then-check (wry pending_ops TOCTOU): if the handshake flipped
+  // between the ready check above and this push, the settle waker already
+  // fired and no further wake is coming — drain this id now. The entry may
+  // already hold earlier queued ops, so drain it FIFO, not just this op.
+  let mut map = PENDING_WINDOW_OPS
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  // First push for this id (empty → non-empty) is the creation-latency
+  // marker (O10-3): one warn per queue lifetime is expected while a
+  // spawned instance's handshake completes — a queue that is never
+  // replayed nor dropped is the anomaly. AMS outright rejection is
+  // covered by the ability-side rollback (notify_ui_ability_start_failed,
+  // ability#53 AF3); a silent wedge here means the start neither completed
+  // nor rolled back. Emitted after the lock is dropped so the logging
+  // backend never runs inside the queue's critical section.
+  let entry = map.entry(window_id).or_default();
+  let first_queued = entry.is_empty();
+  entry.push(op);
+  let queued_len = entry.len();
+  let replay = if openharmony_ability::is_window_ready(window_id) {
+    map.remove(&window_id).unwrap_or_default()
+  } else {
+    Vec::new()
+  };
+  drop(map);
+  if first_queued {
+    log::warn!(
+      "[tao-ohos] window {} not ready (creation handshake pending): {} window op(s) queued",
+      window_id,
+      queued_len
+    );
+  }
+  for op in replay {
+    op();
   }
 }
 
@@ -527,6 +590,70 @@ fn rgba_to_ohos_color(transparent: bool, bg: Option<window::RGBA>) -> Option<u32
     Some(0x00000000)
   } else {
     bg.map(|(r, g, b, a)| ((a as u32) << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
+  }
+}
+
+/// #168 (design D1): the creation-time seed/replay plan derived from the
+/// builder attrs. Pure decision record — the dispatch rides the existing
+/// setter channel ([`Window::dispatch_or_queue`]), while the decision itself
+/// is UT-able without a bridge session (a `Window` cannot be constructed
+/// outside one).
+struct CreationAttrPlan {
+  /// Seed `set_always_on_top(true)` — default `false`, so only a builder
+  /// `true` fires.
+  always_on_top: bool,
+  /// Seed `set_window_decoration_flags` with the attr-derived bitfield;
+  /// `None` = identical to the `FLAG_ALL_DECORATIONS` default → zero
+  /// dispatch.
+  decoration_flags: Option<u8>,
+  /// Replay `set_fullscreen` — upstream windows backend form
+  /// (windows/window.rs:1338-1339): fullscreen takes precedence over
+  /// maximized (else-if).
+  fullscreen: Option<Fullscreen>,
+  /// Replay `set_maximized(true)` (default `false`, so only a builder
+  /// `true` fires).
+  maximized: bool,
+  /// Replay the upstream "not initially focused" semantic
+  /// (`attributes.focused == false`). Upstream consumes `focused` as a
+  /// creation-time don't-focus marker (windows `MARKER_DONT_FOCUS` /
+  /// linux `accept_focus(focusable && focused)`), never as a `set_focus()`
+  /// call; the struct default is `focused: true` and tauri never overrides
+  /// it, so a presence-based `set_focus()` would fire on EVERY window
+  /// creation and violate the spec's zero-extra-traffic scenario. The
+  /// differ-from-default leg maps to `set_focusable(false)` (#174 made
+  /// setFocusable effective on every window) — the persistent
+  /// `accept_focus(false)` semantic.
+  no_initial_focus: bool,
+}
+
+/// #168 (design D1): compute the seed/replay plan. Every field is
+/// "differ from the attribute default", so a default-constructed
+/// `WindowAttributes` plans zero dispatches (spec: default attributes
+/// produce no extra traffic).
+fn creation_attr_plan(attrs: &window::WindowAttributes) -> CreationAttrPlan {
+  let mut flags = FLAG_ALL_DECORATIONS;
+  if !attrs.resizable {
+    flags &= !FLAG_RESIZABLE;
+  }
+  if !attrs.minimizable {
+    flags &= !FLAG_MINIMIZABLE;
+  }
+  if !attrs.maximizable {
+    flags &= !FLAG_MAXIMIZABLE;
+  }
+  if !attrs.closable {
+    flags &= !FLAG_CLOSABLE;
+  }
+  CreationAttrPlan {
+    always_on_top: attrs.always_on_top,
+    decoration_flags: if flags != FLAG_ALL_DECORATIONS {
+      Some(flags)
+    } else {
+      None
+    },
+    fullscreen: attrs.fullscreen.clone(),
+    maximized: attrs.maximized,
+    no_initial_focus: !attrs.focused,
   }
 }
 
@@ -934,6 +1061,14 @@ impl Window {
       );
     }
 
+    // #168 (design D1): seed/replay the remaining creation-time attrs
+    // (always_on_top + decoration_flags seeding, fullscreen/maximized/focused
+    // replay). Everything funnels through the pending-ops queue, so a window
+    // whose creation handshake is pending holds them until the handshake
+    // settles. `visible`/`window_icon`/`preferred_theme` stay unconsumed by
+    // design (facade disclosure, specs/ohos-platform-limitations).
+    win.seed_creation_attrs(&window_attrs);
+
     Ok(win)
   }
 
@@ -983,45 +1118,7 @@ impl Window {
     let Some(window_id) = self.window_id else {
       return;
     };
-    if openharmony_ability::is_window_ready(window_id) {
-      op();
-      return;
-    }
-    // Push-then-check (wry pending_ops TOCTOU): if the handshake flipped
-    // between the ready check above and this push, the settle waker already
-    // fired and no further wake is coming — drain this id now. The entry may
-    // already hold earlier queued ops, so drain it FIFO, not just this op.
-    let mut map = PENDING_WINDOW_OPS
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // First push for this id (empty → non-empty) is the creation-latency
-    // marker (O10-3): one warn per queue lifetime is expected while a
-    // spawned instance's handshake completes — a queue that is never
-    // replayed nor dropped is the anomaly. AMS outright rejection is
-    // covered by the ability-side rollback (notify_ui_ability_start_failed,
-    // ability#53 AF3); a silent wedge here means the start neither completed
-    // nor rolled back. Emitted after the lock is dropped so the logging
-    // backend never runs inside the queue's critical section.
-    let entry = map.entry(window_id).or_default();
-    let first_queued = entry.is_empty();
-    entry.push(op);
-    let queued_len = entry.len();
-    let replay = if openharmony_ability::is_window_ready(window_id) {
-      map.remove(&window_id).unwrap_or_default()
-    } else {
-      Vec::new()
-    };
-    drop(map);
-    if first_queued {
-      log::warn!(
-        "[tao-ohos] window {} not ready (creation handshake pending): {} window op(s) queued",
-        window_id,
-        queued_len
-      );
-    }
-    for op in replay {
-      op();
-    }
+    dispatch_or_queue_op(window_id, op);
   }
 
   /// Future convenience over [`Self::dispatch_or_queue`]: the future is
@@ -1033,6 +1130,57 @@ impl Window {
   {
     let runtime = self.runtime.clone();
     self.dispatch_or_queue(Box::new(move || runtime.spawn(fut)));
+  }
+
+  /// #168 (design D1): seed/replay the creation-time attrs at build() tail.
+  ///
+  /// Both halves ride the existing setter channel — every setter below funnels
+  /// through [`Self::dispatch_or_queue`], so a window whose creation handshake
+  /// is still pending gets its seeds queued in [`PENDING_WINDOW_OPS`] and
+  /// replayed FIFO by [`drain_ready_pending_window_ops`] (zero new
+  /// machinery), while an already-ready window applies them inline. The plan
+  /// is computed by [`creation_attr_plan`]: only attrs that differ from their
+  /// default produce a command.
+  fn seed_creation_attrs(&self, attrs: &window::WindowAttributes) {
+    let plan = creation_attr_plan(attrs);
+    // Decoration flags first: set_maximized's guard reads FLAG_MAXIMIZABLE
+    // from this cache, so the cache must be in place before the replay half.
+    if let Some(flags) = plan.decoration_flags {
+      self.decoration_flags.store(flags, Ordering::Release);
+      if let Some(window_id) = self.window_id {
+        if let Some(client) = self.bridge_client("seed_creation_attrs") {
+          self.spawn_or_queue(async move {
+            if let Err(e) = client
+              .set_window_decoration_flags(window_id, flags as i32)
+              .await
+            {
+              log::warn!(
+                "[tao-ohos] set_window_decoration_flags (creation seed) failed for window {}: {:?}",
+                window_id,
+                e
+              );
+            }
+          });
+        }
+      }
+    }
+    // always_on_top seed: default false, so only a builder `true` fires.
+    if plan.always_on_top {
+      self.set_always_on_top(true);
+    }
+    // Replay half — upstream windows/window.rs:1338-1339 form: fullscreen
+    // takes precedence over maximized (else-if).
+    if let Some(fullscreen) = plan.fullscreen {
+      self.set_fullscreen(Some(fullscreen));
+    } else if plan.maximized {
+      self.set_maximized(true);
+    }
+    // focused: upstream never calls set_focus() from the attribute (see
+    // [`CreationAttrPlan::no_initial_focus`]) — only the explicit
+    // "don't focus on creation" leg replays, through set_focusable(false).
+    if plan.no_initial_focus {
+      self.set_focusable(false);
+    }
   }
 
   /// Dispatch the cached min/max size constraints as one `setWindowLimits`
@@ -2360,6 +2508,172 @@ mod tests {
       "dropped entry not removed"
     );
     openharmony_ability::unregister_pending_ui_ability(DROPPED_ID);
+  }
+
+  // --- #168 (design D1): creation-attr seeding rides the existing
+  // dispatch_or_queue channel. The decision is `creation_attr_plan` (pure);
+  // the enqueue/inline legs run the extracted production body
+  // `dispatch_or_queue_op` with sentinel ids (a `Window` cannot be
+  // constructed outside a bridge session — same discipline as the O10-6
+  // test above).
+
+  /// UT for #168 ①: a build() carrying `always_on_top(true)` with the
+  /// creation handshake pending queues exactly one seed op, which replays
+  /// once the handshake completes; the default attrs of the same plan stay
+  /// dispatch-free.
+  #[test]
+  fn ut_creation_seed_always_on_top_holds_in_queue_before_ready() {
+    const HELD_ID: i64 = i64::MAX - 11;
+    // Idempotent reset so a previously failed run cannot leak registry
+    // entries that would pin these ids as "not ready".
+    openharmony_ability::unregister_pending_ui_ability(HELD_ID);
+    drop_pending_window_ops(HELD_ID);
+
+    let mut attrs = window::WindowAttributes::default();
+    attrs.always_on_top = true;
+    let plan = creation_attr_plan(&attrs);
+    assert!(plan.always_on_top, "always_on_top(true) must plan a seed");
+    assert_eq!(
+      plan.decoration_flags, None,
+      "default decoration flags must not seed"
+    );
+    assert!(plan.fullscreen.is_none(), "default fullscreen must not replay");
+    assert!(!plan.maximized, "default maximized must not replay");
+    assert!(
+      !plan.no_initial_focus,
+      "default focused(true) must not seed a focusable flip"
+    );
+
+    openharmony_ability::register_pending_ui_ability(HELD_ID);
+    assert!(!openharmony_ability::is_window_ready(HELD_ID));
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = ran.clone();
+    dispatch_or_queue_op(HELD_ID, Box::new(move || flag.store(true, Ordering::SeqCst)));
+    let queued_len = PENDING_WINDOW_OPS
+      .lock()
+      .expect("PENDING_WINDOW_OPS poisoned")
+      .get(&HELD_ID)
+      .map(|ops| ops.len());
+    assert_eq!(
+      queued_len,
+      Some(1),
+      "not-ready seed must hold exactly one queued op"
+    );
+    drain_ready_pending_window_ops();
+    assert!(
+      !ran.load(Ordering::SeqCst),
+      "seed ran while the creation handshake was pending"
+    );
+
+    // Handshake completes: the next drain replays the held seed.
+    openharmony_ability::register_ui_ability_stage(HELD_ID);
+    drain_ready_pending_window_ops();
+    assert!(ran.load(Ordering::SeqCst), "held seed not replayed");
+    assert!(
+      !PENDING_WINDOW_OPS
+        .lock()
+        .expect("PENDING_WINDOW_OPS poisoned")
+        .contains_key(&HELD_ID),
+      "drained seed entry not removed"
+    );
+    openharmony_ability::unregister_pending_ui_ability(HELD_ID);
+    drop_pending_window_ops(HELD_ID);
+  }
+
+  /// UT for #168 ②: decoration-attr differences plan ONE combined
+  /// set-decoration-flags seed carrying the attr-derived bitfield — each
+  /// false attr clears exactly its own bit (the maximizable clear matters
+  /// downstream: set_maximized(true)'s guard reads FLAG_MAXIMIZABLE).
+  #[test]
+  fn ut_creation_plan_seeds_decoration_flags_when_attrs_differ() {
+    let mut attrs = window::WindowAttributes::default();
+    attrs.resizable = false;
+    let plan = creation_attr_plan(&attrs);
+    assert_eq!(
+      plan.decoration_flags,
+      Some(FLAG_ALL_DECORATIONS & !FLAG_RESIZABLE),
+      "resizable(false) must seed flags with only the resizable bit cleared"
+    );
+
+    let mut attrs = window::WindowAttributes::default();
+    attrs.minimizable = false;
+    attrs.closable = false;
+    let plan = creation_attr_plan(&attrs);
+    assert_eq!(
+      plan.decoration_flags,
+      Some(FLAG_ALL_DECORATIONS & !(FLAG_MINIMIZABLE | FLAG_CLOSABLE)),
+      "minimizable/closable(false) must clear exactly those bits"
+    );
+
+    let mut attrs = window::WindowAttributes::default();
+    attrs.maximizable = false;
+    let plan = creation_attr_plan(&attrs);
+    assert_eq!(
+      plan.decoration_flags,
+      Some(FLAG_ALL_DECORATIONS & !FLAG_MAXIMIZABLE),
+      "maximizable(false) must clear the maximizable bit"
+    );
+  }
+
+  /// UT for #168 ③: default attributes plan zero dispatches — the spec's
+  /// "default attributes produce no extra traffic" scenario.
+  #[test]
+  fn ut_creation_plan_default_attrs_produce_zero_seeds() {
+    let attrs = window::WindowAttributes::default();
+    let plan = creation_attr_plan(&attrs);
+    assert!(!plan.always_on_top, "default always_on_top must not seed");
+    assert_eq!(
+      plan.decoration_flags, None,
+      "default decoration flags must not seed"
+    );
+    assert!(plan.fullscreen.is_none(), "default fullscreen must not replay");
+    assert!(!plan.maximized, "default maximized must not replay");
+    assert!(
+      !plan.no_initial_focus,
+      "default focused(true) must not seed a focusable flip"
+    );
+  }
+
+  /// UT for #168 ④: a seed dispatched while the window is already ready runs
+  /// inline — no queue entry, nothing to replay (same semantics as the
+  /// runtime setters).
+  #[test]
+  fn ut_creation_seed_dispatches_inline_when_ready() {
+    const READY_ID: i64 = i64::MAX - 12;
+    openharmony_ability::unregister_pending_ui_ability(READY_ID);
+    drop_pending_window_ops(READY_ID);
+    assert!(
+      openharmony_ability::is_window_ready(READY_ID),
+      "unknown ids must read as ready"
+    );
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = ran.clone();
+    dispatch_or_queue_op(READY_ID, Box::new(move || flag.store(true, Ordering::SeqCst)));
+    assert!(
+      ran.load(Ordering::SeqCst),
+      "ready-window seed must dispatch inline"
+    );
+    assert!(
+      !PENDING_WINDOW_OPS
+        .lock()
+        .expect("PENDING_WINDOW_OPS poisoned")
+        .contains_key(&READY_ID),
+      "inline dispatch must not leave a queue entry"
+    );
+  }
+
+  /// UT for #168 (replay half decision record): fullscreen and maximized are
+  /// both recorded when set — the fullscreen-takes-precedence ordering
+  /// (upstream windows/window.rs:1338-1339 else-if form) lives in
+  /// seed_creation_attrs and is compiled against this plan shape.
+  #[test]
+  fn ut_creation_plan_records_fullscreen_and_maximized() {
+    let mut attrs = window::WindowAttributes::default();
+    attrs.fullscreen = Some(Fullscreen::Borderless(None));
+    attrs.maximized = true;
+    let plan = creation_attr_plan(&attrs);
+    assert!(plan.fullscreen.is_some(), "fullscreen attr must be recorded");
+    assert!(plan.maximized, "maximized attr must be recorded");
   }
 
   // --- #184: lazy bridge-client re-fetch policy (design D8). The helper is
