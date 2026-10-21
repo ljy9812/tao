@@ -481,6 +481,13 @@ impl WindowBuilder {
   ///
   /// See [`Window::set_visible`] for details.
   ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** Ignored at creation time — the platform backend does
+  ///   not consume a `visible: false` attribute during window creation
+  ///   (committer #168); windows are created visible. Toggle visibility with
+  ///   [`Window::set_visible`] after creation instead.
+  ///
   /// [`Window::set_visible`]: crate::window::Window::set_visible
   #[inline]
   pub fn with_visible(mut self, visible: bool) -> Self {
@@ -534,6 +541,13 @@ impl WindowBuilder {
   ///
   /// See [`Window::set_window_icon`] for details.
   ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** Ignored at creation time — the platform backend does
+  ///   not consume a window icon during window creation (committer #168);
+  ///   there is no runtime `set_window_icon` on OHOS either, so the icon has
+  ///   no effect for the lifetime of the window.
+  ///
   /// [`Window::set_window_icon`]: crate::window::Window::set_window_icon
   #[inline]
   pub fn with_window_icon(mut self, window_icon: Option<Icon>) -> Self {
@@ -550,6 +564,11 @@ impl WindowBuilder {
   ///   or use `None` so it automatically uses the theme used in [`EventLoopBuilderExtWindows::with_theme`]
   ///   or falls back to the system preference, because [`EventLoopBuilderExtWindows::with_theme`] changes
   ///   the theme for some controls like context menus which is app-wide and can't be changed by this method.
+  ///
+  /// - **OpenHarmony:** Ignored at creation time — the platform backend does
+  ///   not consume a preferred theme during window creation (committer #168);
+  ///   the window follows the system theme. `Window::set_theme` runtime
+  ///   requests are unaffected.
   ///
   /// [`EventLoopBuilderExtWindows::with_theme`]: crate::platform::windows::EventLoopBuilderExtWindows::with_theme
   #[allow(rustdoc::broken_intra_doc_links)]
