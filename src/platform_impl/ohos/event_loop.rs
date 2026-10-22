@@ -587,7 +587,12 @@ impl<T: 'static> EventLoop<T> {
         ImeEvent::BackspaceEvent(_) => {
           // No physical key events exist for IME edits — mock Backspace so
           // web engines / GUI toolkits can react to the deletion.
-          emit_synthetic_key(event_loop_cell, window_id, Key::Backspace, KeyCode::Backspace);
+          emit_synthetic_key(
+            event_loop_cell,
+            window_id,
+            Key::Backspace,
+            KeyCode::Backspace,
+          );
         }
         ImeEvent::EnterEvent(_) => {
           // Same as Backspace: mock an Enter key press.
@@ -613,7 +618,11 @@ impl<T: 'static> EventLoop<T> {
   /// Handle mouse events from the OHOS NDK, converting them to tao WindowEvents.
   /// `window_id` is the routed window (from the originating input event,
   /// Phase 4 design.md D5).
-  fn handle_mouse_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, window_id: window::WindowId, mouse_event: &MouseEventData) {
+  fn handle_mouse_event(
+    event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>,
+    window_id: window::WindowId,
+    mouse_event: &MouseEventData,
+  ) {
     // Use device_id 0 for mouse, consistent across events.
     let device_id = event::DeviceId(DeviceId(0));
 
@@ -697,7 +706,11 @@ impl<T: 'static> EventLoop<T> {
   /// Handle axis (scroll wheel) events from the OHOS ArkUI runtime.
   /// `window_id` is the routed window (from the originating input event,
   /// Phase 4 design.md D5).
-  fn handle_axis_event(event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>, window_id: window::WindowId, axis_event: &AxisEventData) {
+  fn handle_axis_event(
+    event_loop_cell: &Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>,
+    window_id: window::WindowId,
+    axis_event: &AxisEventData,
+  ) {
     let device_id = event::DeviceId(DeviceId(0));
     let is_touchpad = axis_event.source_type == InputSourceType::Touchpad;
 
@@ -1161,7 +1174,9 @@ impl<T: 'static> EventLoop<T> {
         // receives the matching LostFocus half of the pair, keeping the
         // bit in step; read sites are unchanged. The helper also performs
         // the R21 stale-modifier reset (issue #137) before Focused(true).
-        MainEvent::GainedFocus { window_id } => Self::handle_gained_focus(&event_loop_cell, window_id),
+        MainEvent::GainedFocus { window_id } => {
+          Self::handle_gained_focus(&event_loop_cell, window_id)
+        }
         MainEvent::LostFocus { window_id } => {
           // Phase 4 (design.md D5): mirror of GainedFocus — route by the
           // losing instance's window id; HAS_FOCUS stays app-level.
@@ -1743,7 +1758,11 @@ mod input_tests {
   #[test]
   fn axis_idle_event_emits_nothing() {
     let evs = run_collected(|cell| {
-      EventLoop::<()>::handle_axis_event(cell, window::WindowId(WindowId(0)), &AxisEventData::default());
+      EventLoop::<()>::handle_axis_event(
+        cell,
+        window::WindowId(WindowId(0)),
+        &AxisEventData::default(),
+      );
     });
     assert!(evs.is_empty());
   }
@@ -1925,24 +1944,16 @@ mod input_tests {
     set_modifiers(ModifiersState::empty());
     let route_ids: Arc<Mutex<Vec<window::WindowId>>> = Arc::new(Mutex::new(Vec::new()));
     let route_sink = route_ids.clone();
-    let route_cell: LoopCell<()> = Arc::new(RefCell::new(Some(Box::new(
-      move |e: event::Event<()>| {
+    let route_cell: LoopCell<()> =
+      Arc::new(RefCell::new(Some(Box::new(move |e: event::Event<()>| {
         if let event::Event::WindowEvent { window_id, .. } = e {
           route_sink.lock().unwrap().push(window_id);
         }
-      },
-    ))));
-    EventLoop::<()>::handle_input_event(
-      &route_cell,
-      5,
-      &key(OhosKeyCode::ShiftLeft, Action::Down),
-    );
+      }))));
+    EventLoop::<()>::handle_input_event(&route_cell, 5, &key(OhosKeyCode::ShiftLeft, Action::Down));
     assert_eq!(
       route_ids.lock().unwrap().clone(),
-      vec![
-        window::WindowId(WindowId(5)),
-        window::WindowId(WindowId(5)),
-      ]
+      vec![window::WindowId(WindowId(5)), window::WindowId(WindowId(5)),]
     );
     PRESSED_KEYS.with(|k| k.borrow_mut().clear());
     set_modifiers(ModifiersState::empty());
@@ -2000,11 +2011,7 @@ mod input_tests {
         0,
         &InputEvent::ImeEvent(ImeEvent::BackspaceEvent(1)),
       );
-      EventLoop::<()>::handle_input_event(
-        cell,
-        0,
-        &InputEvent::ImeEvent(ImeEvent::EnterEvent(1)),
-      );
+      EventLoop::<()>::handle_input_event(cell, 0, &InputEvent::ImeEvent(ImeEvent::EnterEvent(1)));
     });
     assert_eq!(evs.len(), 4);
     assert!(evs[0].starts_with("Key(Pressed,Backspace"), "{}", evs[0]);
@@ -2045,13 +2052,11 @@ mod input_tests {
     // the historical hardcoded primary.
     let ids: Arc<Mutex<Vec<window::WindowId>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = ids.clone();
-    let cell: LoopCell<()> = Arc::new(RefCell::new(Some(Box::new(
-      move |e: event::Event<()>| {
-        if let event::Event::WindowEvent { window_id, .. } = e {
-          sink.lock().unwrap().push(window_id);
-        }
-      },
-    ))));
+    let cell: LoopCell<()> = Arc::new(RefCell::new(Some(Box::new(move |e: event::Event<()>| {
+      if let event::Event::WindowEvent { window_id, .. } = e {
+        sink.lock().unwrap().push(window_id);
+      }
+    }))));
     EventLoop::<()>::handle_input_event(
       &cell,
       7,
@@ -2173,8 +2178,8 @@ mod live_window_ids_tests {
 /// test cannot inherit our state.
 #[cfg(test)]
 mod focus_scale_tests {
-  use super::*;
   use super::super::window::{WindowStateMirror, WINDOW_MIRRORS_TEST_LOCK};
+  use super::*;
 
   type LoopCell<T> = Arc<RefCell<Option<Box<dyn FnMut(event::Event<T>) + 'static>>>>;
 
@@ -2226,7 +2231,9 @@ mod focus_scale_tests {
   /// matching INACTIVE) from leaving a stale focused bit.
   #[test]
   fn ut_focus_drain_gain_edge_forwards_and_pairs_blur() {
-    let _guard = WINDOW_MIRRORS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = WINDOW_MIRRORS_TEST_LOCK
+      .lock()
+      .unwrap_or_else(|p| p.into_inner());
     const PREV: i64 = i64::MAX - 21;
     const NEW: i64 = i64::MAX - 22;
     let has_focus_before = HAS_FOCUS.load(Ordering::Relaxed);
@@ -2244,27 +2251,42 @@ mod focus_scale_tests {
     });
     assert_eq!(
       events,
-      vec![
-        format!("focus:{PREV}:false"),
-        format!("focus:{NEW}:true")
-      ],
+      vec![format!("focus:{PREV}:false"), format!("focus:{NEW}:true")],
       "gain edge must pair-clear the previous holder before the gain"
     );
-    assert!(!prev_mirror.focused.load(Ordering::SeqCst), "paired blur did not clear PREV's focused bit");
-    assert!(new_mirror.focused.load(Ordering::SeqCst), "gain did not set NEW's focused bit");
-    assert_eq!(last_focused(), NEW, "gain edge must sync the shared snapshot");
+    assert!(
+      !prev_mirror.focused.load(Ordering::SeqCst),
+      "paired blur did not clear PREV's focused bit"
+    );
+    assert!(
+      new_mirror.focused.load(Ordering::SeqCst),
+      "gain did not set NEW's focused bit"
+    );
+    assert_eq!(
+      last_focused(),
+      NEW,
+      "gain edge must sync the shared snapshot"
+    );
 
     HAS_FOCUS.store(has_focus_before, Ordering::Relaxed);
     set_last_focused(0);
-    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&PREV);
-    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&NEW);
+    WINDOW_MIRRORS
+      .lock()
+      .expect("WINDOW_MIRRORS poisoned")
+      .remove(&PREV);
+    WINDOW_MIRRORS
+      .lock()
+      .expect("WINDOW_MIRRORS poisoned")
+      .remove(&NEW);
   }
 
   /// UT for #180① ② (design D7): a same-window same-state gain edge is
   /// swallowed — zero WindowEvents, zero mirror writes, snapshot unchanged.
   #[test]
   fn ut_focus_drain_duplicate_gain_edge_is_swallowed() {
-    let _guard = WINDOW_MIRRORS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = WINDOW_MIRRORS_TEST_LOCK
+      .lock()
+      .unwrap_or_else(|p| p.into_inner());
     const W: i64 = i64::MAX - 22;
     let has_focus_before = HAS_FOCUS.load(Ordering::Relaxed);
     let mirror = register_mirror(W, true);
@@ -2277,12 +2299,22 @@ mod focus_scale_tests {
       EventLoop::<()>::handle_pending_window_focus(cell, W, true);
     });
     assert!(events.is_empty(), "duplicate gain edge must emit nothing");
-    assert!(mirror.focused.load(Ordering::SeqCst), "swallowed edge must not touch the mirror");
-    assert_eq!(last_focused(), W, "swallowed edge must not move the snapshot");
+    assert!(
+      mirror.focused.load(Ordering::SeqCst),
+      "swallowed edge must not touch the mirror"
+    );
+    assert_eq!(
+      last_focused(),
+      W,
+      "swallowed edge must not move the snapshot"
+    );
 
     HAS_FOCUS.store(has_focus_before, Ordering::Relaxed);
     set_last_focused(0);
-    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&W);
+    WINDOW_MIRRORS
+      .lock()
+      .expect("WINDOW_MIRRORS poisoned")
+      .remove(&W);
   }
 
   /// UT for #180① (design D7 loss edge): a loss edge applies only when the
@@ -2292,7 +2324,9 @@ mod focus_scale_tests {
   /// own the app-level bit).
   #[test]
   fn ut_focus_drain_loss_edge_applies_only_to_recorded_holder() {
-    let _guard = WINDOW_MIRRORS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = WINDOW_MIRRORS_TEST_LOCK
+      .lock()
+      .unwrap_or_else(|p| p.into_inner());
     const W: i64 = i64::MAX - 23;
     const OTHER: i64 = i64::MAX - 24;
     let has_focus_before = HAS_FOCUS.load(Ordering::Relaxed);
@@ -2306,28 +2340,54 @@ mod focus_scale_tests {
       EventLoop::<()>::handle_pending_window_focus(cell, OTHER, false);
     });
     assert!(events.is_empty(), "blur for a non-holder must be swallowed");
-    assert!(mirror.focused.load(Ordering::SeqCst), "swallowed blur must not touch the holder");
-    assert_eq!(last_focused(), W, "swallowed blur must not clear the snapshot");
+    assert!(
+      mirror.focused.load(Ordering::SeqCst),
+      "swallowed blur must not touch the holder"
+    );
+    assert_eq!(
+      last_focused(),
+      W,
+      "swallowed blur must not clear the snapshot"
+    );
 
     // Holder blur: the blur write face + snapshot → 0; HAS_FOCUS untouched.
     let events = run_collected::<()>(|cell| {
       EventLoop::<()>::handle_pending_window_focus(cell, W, false);
     });
-    assert_eq!(events, vec![format!("focus:{W}:false")], "holder blur must dispatch Focused(false)");
-    assert!(!mirror.focused.load(Ordering::SeqCst), "holder blur did not clear the focused bit");
+    assert_eq!(
+      events,
+      vec![format!("focus:{W}:false")],
+      "holder blur must dispatch Focused(false)"
+    );
+    assert!(
+      !mirror.focused.load(Ordering::SeqCst),
+      "holder blur did not clear the focused bit"
+    );
     assert_eq!(last_focused(), 0, "holder blur must clear the snapshot");
-    assert!(HAS_FOCUS.load(Ordering::Relaxed), "drain blur must not touch the app-level HAS_FOCUS");
+    assert!(
+      HAS_FOCUS.load(Ordering::Relaxed),
+      "drain blur must not touch the app-level HAS_FOCUS"
+    );
 
     // Repeat blur now finds no holder: swallowed.
     let events = run_collected::<()>(|cell| {
       EventLoop::<()>::handle_pending_window_focus(cell, W, false);
     });
-    assert!(events.is_empty(), "repeat blur with no holder must be swallowed");
+    assert!(
+      events.is_empty(),
+      "repeat blur with no holder must be swallowed"
+    );
     assert!(!other_mirror.focused.load(Ordering::SeqCst));
 
     HAS_FOCUS.store(has_focus_before, Ordering::Relaxed);
-    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&W);
-    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&OTHER);
+    WINDOW_MIRRORS
+      .lock()
+      .expect("WINDOW_MIRRORS poisoned")
+      .remove(&W);
+    WINDOW_MIRRORS
+      .lock()
+      .expect("WINDOW_MIRRORS poisoned")
+      .remove(&OTHER);
   }
 
   /// UT for #180① ③ (design D7): the stage path and the Float drain share
@@ -2337,7 +2397,9 @@ mod focus_scale_tests {
   /// stage-focused window still pair-clears it.
   #[test]
   fn ut_focus_stage_and_float_share_edge_snapshot() {
-    let _guard = WINDOW_MIRRORS_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _guard = WINDOW_MIRRORS_TEST_LOCK
+      .lock()
+      .unwrap_or_else(|p| p.into_inner());
     const STAGE: i64 = i64::MAX - 21;
     const FLOAT: i64 = i64::MAX - 22;
     let has_focus_before = HAS_FOCUS.load(Ordering::Relaxed);
@@ -2351,8 +2413,16 @@ mod focus_scale_tests {
     let events = run_collected::<()>(|cell| {
       EventLoop::<()>::handle_gained_focus(cell, STAGE);
     });
-    assert_eq!(events, vec![format!("focus:{STAGE}:true")], "stage gain must forward Focused(true)");
-    assert_eq!(last_focused(), STAGE, "stage gain must sync the shared snapshot");
+    assert_eq!(
+      events,
+      vec![format!("focus:{STAGE}:true")],
+      "stage gain must forward Focused(true)"
+    );
+    assert_eq!(
+      last_focused(),
+      STAGE,
+      "stage gain must sync the shared snapshot"
+    );
     assert!(stage_mirror.focused.load(Ordering::SeqCst));
 
     // Cross-path duplicate: a Float drain gain for the same window (already
@@ -2360,7 +2430,10 @@ mod focus_scale_tests {
     let events = run_collected::<()>(|cell| {
       EventLoop::<()>::handle_pending_window_focus(cell, STAGE, true);
     });
-    assert!(events.is_empty(), "cross-path duplicate gain must be swallowed");
+    assert!(
+      events.is_empty(),
+      "cross-path duplicate gain must be swallowed"
+    );
 
     // Float gain over the stage-focused window: paired blur on STAGE first.
     let events = run_collected::<()>(|cell| {
@@ -2379,8 +2452,14 @@ mod focus_scale_tests {
 
     HAS_FOCUS.store(has_focus_before, Ordering::Relaxed);
     set_last_focused(0);
-    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&STAGE);
-    WINDOW_MIRRORS.lock().expect("WINDOW_MIRRORS poisoned").remove(&FLOAT);
+    WINDOW_MIRRORS
+      .lock()
+      .expect("WINDOW_MIRRORS poisoned")
+      .remove(&STAGE);
+    WINDOW_MIRRORS
+      .lock()
+      .expect("WINDOW_MIRRORS poisoned")
+      .remove(&FLOAT);
   }
 
   /// UT for #180 (design D8): the same scale value forwarded repeatedly
@@ -2402,7 +2481,10 @@ mod focus_scale_tests {
     assert!(!scale_should_forward(1.5), "repeat #3 must be swallowed");
     // A real change forwards again.
     assert!(scale_should_forward(2.0), "a changed scale must forward");
-    assert!(!scale_should_forward(2.0), "repeat after the change must be swallowed");
+    assert!(
+      !scale_should_forward(2.0),
+      "repeat after the change must be swallowed"
+    );
     // A different value whose f64 bits differ forwards. NOTE: `2.0 +
     // f64::EPSILON` is NOT a bitwise change — EPSILON (2^-52) is half the ULP
     // at 2.0 (ULP = 2^-51 there), so the sum rounds back to exactly 2.0. Step
