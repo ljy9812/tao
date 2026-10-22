@@ -617,12 +617,16 @@ struct CreationAttrPlan {
   /// (`attributes.focused == false`). Upstream consumes `focused` as a
   /// creation-time don't-focus marker (windows `MARKER_DONT_FOCUS` /
   /// linux `accept_focus(focusable && focused)`), never as a `set_focus()`
-  /// call; the struct default is `focused: true` and tauri never overrides
-  /// it, so a presence-based `set_focus()` would fire on EVERY window
-  /// creation and violate the spec's zero-extra-traffic scenario. The
-  /// differ-from-default leg maps to `set_focusable(false)` (#174 made
-  /// setFocusable effective on every window) — the persistent
-  /// `accept_focus(false)` semantic.
+  /// call. The attribute default is `focused: true`, and tauri's window
+  /// config `focus` (default true, settable false) is forwarded by
+  /// runtime-wry into attributes — so both "never specified" and "explicitly
+  /// true" hit the differ-from-default no-op, while `false` maps to
+  /// `set_focusable(false)` (#174 made setFocusable effective on every
+  /// window) — the PERSISTENT `accept_focus(false)` semantic: gtk-aligned
+  /// (the window stays unfocusable), deliberately diverging from Windows'
+  /// create-unfocused-but-still-focusable. A presence-based `set_focus()`
+  /// would fire on every window creation and violate the spec's
+  /// zero-extra-traffic scenario.
   no_initial_focus: bool,
 }
 
