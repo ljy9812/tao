@@ -2403,8 +2403,14 @@ mod focus_scale_tests {
     // A real change forwards again.
     assert!(scale_should_forward(2.0), "a changed scale must forward");
     assert!(!scale_should_forward(2.0), "repeat after the change must be swallowed");
-    // A different value whose f64 bits differ forwards even at a tiny delta.
-    assert!(scale_should_forward(2.0 + f64::EPSILON), "bitwise change must forward");
+    // A different value whose f64 bits differ forwards. NOTE: `2.0 +
+    // f64::EPSILON` is NOT a bitwise change — EPSILON (2^-52) is half the ULP
+    // at 2.0 (ULP = 2^-51 there), so the sum rounds back to exactly 2.0. Step
+    // one bit instead.
+    assert!(
+      scale_should_forward(f64::from_bits(2.0f64.to_bits() + 1)),
+      "bitwise change must forward"
+    );
 
     // Theme independence: scale dedup left the theme snapshot untouched, and
     // a theme value still passes through its own guard.
