@@ -60,14 +60,30 @@ pub trait WindowExtOpenHarmony {
   /// (e.g. wry's `WebviewClient::from_bridge`).
   fn bridge_runtime(&self) -> openharmony_ability::BridgeRuntime;
 
-  /// Destroys the OS-level window: SubWindow sub-windows call `destroyWindow`;
-  /// the main (UIAbility) window is system-managed — in-app destroys are
-  /// rejected by the bridge for window id 0.
+  /// Destroys the OS-level window. Only non-id-0 windows have an executable
+  /// path here — SubWindow sub-windows and spawned UIAbility-kind instances
+  /// call the bridge's `destroyWindow`; the ArkTS bridge REJECTS
+  /// `destroy-window` for window id 0 (openharmony-ability
+  /// WindowPlugin.ets), so the main window is system-managed and a
+  /// main-window `close()` can only resolve Err. The embedding runtime's
+  /// main-window close arm never dispatches `inner.close()` at all (its
+  /// main-window gate runs the exit gate instead; the only executable
+  /// `inner.close()` call is the non-main-window branch) — the main window is
+  /// terminated by the system through that exit chain, not by this call.
   ///
   /// Fire-and-forget — the bridge call is spawned on the window's bridge
-  /// executor. Recursion-safe against the sub-window close flow: the synthesized
-  /// `CloseRequested` this eventually triggers finds the runtime-side book
-  /// already cleaned up.
+  /// executor. On a successful resolve the window id is enqueued as a
+  /// destruction confirmation and the event loop synthesizes
+  /// `Event::WindowEvent::Destroyed`: that confirmation channel serves the
+  /// NON-main windows (sub-windows / spawned UIAbility instances — for the
+  /// main window an Ok resolve is unreachable, so there is no re-emitted
+  /// `Destroyed` on that path). On a failed resolve tao warns and accounts the
+  /// id in the destroy-failure twin queue (`drain_destroy_failures`, re-export
+  /// below) so the runtime can clear its in-flight close guard; no Event is
+  /// emitted for a failure. Recursion-safe against the confirmation-driven
+  /// close flow: the loopback `CloseRequested` this eventually triggers finds
+  /// the runtime-side in-flight guard set and routes to the confirmation
+  /// executor.
   fn close(&self);
 }
 
