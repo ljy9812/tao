@@ -148,6 +148,13 @@ impl WindowBuilderExtOpenHarmony for WindowBuilder {
 
 pub use crate::platform_impl::OHOSWindowKind;
 
+/// Re-export of the destroy-failure drain (issue Eulogizethesun/tauri#255):
+/// the embedding runtime (tauri-runtime-wry) drains the OHOS window ids whose
+/// `close()`-dispatched destroy failed, to clear its in-flight close guard.
+/// Same export path as the destroy-confirmation twin's platform surface
+/// ([`crate::platform_impl::OHOSWindowKind`] et al.).
+pub use crate::platform_impl::drain_destroy_failures;
+
 pub trait EventLoopBuilderExtOpenHarmony {
   /// Associates the [`OpenHarmonyApp`] that was passed to `openharmony-ability::ability` with the event loop
   ///

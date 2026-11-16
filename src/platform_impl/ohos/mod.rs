@@ -24,7 +24,7 @@ mod window;
 pub use event_loop::{DeviceId, EventLoop, EventLoopProxy, EventLoopWindowTarget, KeyEventExtra};
 pub use monitor::{MonitorHandle, VideoMode};
 pub use window::{
-  keycode_from_scancode, keycode_to_scancode, OHOSWindowKind, OsError,
+  drain_destroy_failures, keycode_from_scancode, keycode_to_scancode, OHOSWindowKind, OsError,
   PlatformSpecificWindowBuilderAttributes,
 };
 

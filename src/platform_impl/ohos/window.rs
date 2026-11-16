@@ -226,6 +226,50 @@ pub(crate) fn drain_destroy_confirmations() -> Vec<i64> {
   )
 }
 
+/// Failure twin of [`DESTROY_CONFIRMATIONS`] (issue Eulogizethesun/tauri#255):
+/// destroy requests this process issued through [`Window::close`] that FAILED
+/// to reach the bridge -- (b) the window's bridge client is unavailable, and
+/// (c) the async `destroy_window` resolve returned Err. (a) A window with no
+/// OHOS id (`window_id == None`) fails before anything can be keyed: there is
+/// no id to enqueue, so that path stays a log-only failure -- the embedding
+/// runtime can observe the None id directly at its initiate site
+/// (`WindowExtOpenHarmony::window_id()`), which is where its in-flight close
+/// guard lives.
+///
+/// The embedding runtime (tauri-runtime-wry) drains this queue through
+/// [`drain_destroy_failures`] and uses it to clear the in-flight close guard
+/// it set before dispatching, so a failed destroy does not make the next
+/// USER-initiated `CloseRequested` be misread as the destruction loopback
+/// (which would skip the app-facing dispatch and tear down accounting for a
+/// window that is still alive). tao itself announces nothing: no Event variant
+/// is added -- the failure is "accounted, not announced" and the runtime owns
+/// the guard (design D3 keeps tao's failed resolve silent on the event lane).
+/// Enqueue happens on the dispatching thread (main thread or bridge executor);
+/// the drain runs on the embedding runtime's thread -- hence the mutex.
+pub(crate) static DESTROY_FAILURES: std::sync::LazyLock<std::sync::Mutex<Vec<i64>>> =
+  std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+pub(crate) fn enqueue_destroy_failure(window_id: i64) {
+  DESTROY_FAILURES
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+    .push(window_id);
+}
+
+/// Drains the failure twin of the destroy-confirmation queue: the OHOS window
+/// ids whose `close()`-dispatched `destroy-window` bridge call failed (bridge
+/// client unavailable, or the async resolve returned Err -- see
+/// [`DESTROY_FAILURES`]). Consuming read: each id is returned exactly once.
+/// Exported for the embedding runtime (tauri-runtime-wry), which pairs it with
+/// its own in-flight close guard; tao never drains it itself.
+pub fn drain_destroy_failures() -> Vec<i64> {
+  std::mem::take(
+    &mut *DESTROY_FAILURES
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner()),
+  )
+}
+
 /// Writes the per-window focused bit (#173) through [`WINDOW_MIRRORS`].
 /// A miss (unknown id, or the mirror already unregistered because the
 /// `Window` was dropped) is silently skipped -- same tolerance as the
@@ -1924,30 +1968,58 @@ impl Window {
   /// synthesizes `Event::WindowEvent::Destroyed` (design D2 channel (a)) --
   /// the deterministic confirmation for the embedding runtime's
   /// confirmation-driven accounting, covering the paths where the ArkTS
-  /// notifyWindowClose loopback cannot fire. A failed resolve stays silent
-  /// (design D3: failure = no event, the caller keeps its accounting).
+  /// notifyWindowClose loopback cannot fire. A failed resolve stays silent on
+  /// the event lane (design D3: failure = no event, the caller keeps its
+  /// accounting) but is ACCOUNTED: issue Eulogizethesun/tauri#255 -- the id
+  /// goes into [`DESTROY_FAILURES`] (the failure twin of the confirmation
+  /// queue) and the loop is woken, so the runtime can drain it and clear the
+  /// in-flight close guard it set before dispatching (otherwise the next
+  /// USER-initiated CloseRequested is misread as the destruction loopback).
+  /// The bridge-client-unavailable leg accounts the same way; the no-OHOS-id
+  /// leg is log-only (nothing to key the record on -- see the arm below).
   pub fn close(&self) {
-    if let Some(window_id) = self.window_id {
-      let Some(client) = self.bridge_client("close") else {
-        return;
-      };
-      let app = self.app.clone();
-      self.spawn_or_queue(async move {
-        match client.destroy_window(window_id).await {
-          Ok(()) => {
-            enqueue_destroy_confirmation(window_id);
-            app.create_waker().wake();
-          }
-          Err(e) => {
-            log::warn!(
-              "close: destroy_window failed for window {}: {:?}",
-              window_id,
-              e
-            );
-          }
+    let Some(window_id) = self.window_id else {
+      // Failure leg (a): no OHOS id -- the creation handshake never settled,
+      // so nothing was dispatched and there is no id to key a
+      // DESTROY_FAILURES record on (0 is the main window's REAL id, so no
+      // sentinel is safe; the embedding runtime can observe the None id
+      // directly at its initiate site via WindowExtOpenHarmony::window_id()).
+      log::warn!(
+        "close: window has no OHOS id (creation handshake never settled) — nothing dispatched"
+      );
+      return;
+    };
+    let Some(client) = self.bridge_client("close") else {
+      // Failure leg (b): bridge client unavailable. The shared degradation
+      // warn (bridge_client_cached_or_refetch) fired debounced; this leg is
+      // accounted per attempt so the runtime's in-flight close guard is
+      // cleared even when the bridge never comes back.
+      enqueue_destroy_failure(window_id);
+      self.app.create_waker().wake();
+      return;
+    };
+    let app = self.app.clone();
+    self.spawn_or_queue(async move {
+      match client.destroy_window(window_id).await {
+        Ok(()) => {
+          enqueue_destroy_confirmation(window_id);
+          app.create_waker().wake();
         }
-      });
-    }
+        Err(e) => {
+          // Failure leg (c): the async resolve failed. Warn AND account
+          // (issue Eulogizethesun/tauri#255): the runtime drains the id and
+          // clears its in-flight close guard, so the next USER close is not
+          // misread as the destruction loopback. Still no event (D3).
+          log::warn!(
+            "close: destroy_window failed for window {}: {:?}",
+            window_id,
+            e
+          );
+          enqueue_destroy_failure(window_id);
+          app.create_waker().wake();
+        }
+      }
+    });
   }
 
   /// Whether the app holds focus — an app-level (per-UIAbility-stage) bit,
@@ -2737,7 +2809,8 @@ impl Window {
     // Cache-on-set read-back: OHOS has no synchronous title query. The cache
     // carries the last set_title intent; None until the first set returns the
     // empty string (the pre-fix return for never-titled windows).
-    self.title
+    self
+      .title
       .lock()
       .expect("title cache poisoned")
       .clone()
@@ -3408,6 +3481,7 @@ mod tests {
       runtime: BridgeExecutor::new(),
       mirror: mirror.clone(),
       decorations: AtomicBool::new(true),
+      title: std::sync::Mutex::new(None),
       transparent: false,
       always_on_top: AtomicBool::new(false),
       decoration_flags: AtomicU8::new(15),
@@ -3470,6 +3544,7 @@ mod tests {
       runtime: BridgeExecutor::new(),
       mirror: mirror.clone(),
       decorations: AtomicBool::new(true),
+      title: std::sync::Mutex::new(None),
       transparent: false,
       always_on_top: AtomicBool::new(false),
       decoration_flags: AtomicU8::new(15),
@@ -3526,6 +3601,7 @@ mod tests {
       runtime: BridgeExecutor::new(),
       mirror: mirror.clone(),
       decorations: AtomicBool::new(true),
+      title: std::sync::Mutex::new(None),
       transparent: false,
       always_on_top: AtomicBool::new(false),
       decoration_flags: AtomicU8::new(15),
@@ -3594,6 +3670,7 @@ mod tests {
       runtime: BridgeExecutor::new(),
       mirror: Arc::new(WindowStateMirror::new(true)),
       decorations: AtomicBool::new(true),
+      title: std::sync::Mutex::new(None),
       transparent: false,
       always_on_top: AtomicBool::new(false),
       decoration_flags: AtomicU8::new(FLAG_ALL_DECORATIONS),
@@ -3679,6 +3756,7 @@ mod tests {
       runtime: BridgeExecutor::new(),
       mirror: Arc::new(WindowStateMirror::new(true)),
       decorations: AtomicBool::new(true),
+      title: std::sync::Mutex::new(None),
       transparent: false,
       always_on_top: AtomicBool::new(false),
       decoration_flags: AtomicU8::new(FLAG_ALL_DECORATIONS),
@@ -4029,5 +4107,47 @@ mod fmt_tests {
   fn os_error_display_writes_message() {
     assert_eq!(format!("{}", OsError), "OpenHarmony OS Error");
     assert_eq!(format!("{:?}", OsError), "OsError"); // Debug derive
+  }
+}
+
+// DESTROY_FAILURES (issue Eulogizethesun/tauri#255) — appended at file end,
+// keeps existing line numbers. The queue is a process global shared with any
+// close() call in the binary; these tests serialize on a dedicated lock so a
+// drain assertion only ever sees its own enqueues (same discipline as
+// WINDOW_MIRRORS_TEST_LOCK).
+#[cfg(test)]
+mod destroy_failure_tests {
+  use super::{drain_destroy_failures, enqueue_destroy_failure};
+  use std::sync::Mutex;
+
+  static DESTROY_FAILURES_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+  fn lock() -> std::sync::MutexGuard<'static, ()> {
+    DESTROY_FAILURES_TEST_LOCK
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+  }
+
+  #[test]
+  fn destroy_failures_enqueue_then_drain_returns_fifo_and_consumes() {
+    let _guard = lock();
+    // Defensive isolation: whatever an earlier (non-serialized) close() left
+    // behind is drained away before the assertion window opens.
+    let _ = drain_destroy_failures();
+    enqueue_destroy_failure(41);
+    enqueue_destroy_failure(43);
+    // FIFO: the runtime pairs drained ids against its in-flight close guards
+    // in dispatch order, so order is part of the contract.
+    assert_eq!(drain_destroy_failures(), vec![41, 43]);
+    // Consuming read: each failure is returned exactly once.
+    assert!(drain_destroy_failures().is_empty());
+  }
+
+  #[test]
+  fn destroy_failures_drain_on_untouched_queue_returns_empty() {
+    let _guard = lock();
+    // Serialized against the enqueue test, so this observes either the
+    // cold-start empty queue or the post-drain empty queue.
+    assert!(drain_destroy_failures().is_empty());
   }
 }
