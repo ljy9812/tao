@@ -389,6 +389,46 @@ pub(crate) fn set_app_theme(app: &OpenHarmonyApp, theme: Option<Theme>) {
   }
 }
 
+/// Issue Eulogizethesun/tauri#222 drain leg: applies ONE deferred setColorMode
+/// completion (the `openharmony_ability::take_color_mode_completion()` slot —
+/// `Some(true)` executed, `Some(false)` failed, `None` nothing new). Returns
+/// whether a failure completion rolled [`APP_THEME_OVERRIDE`] back to
+/// FOLLOW (pure apart from that store — device-testable).
+///
+/// WHY a drain and not a poll at the call site: the set-color-mode chain —
+/// `set_app_theme` → `ColorModeExt::set_color_mode` (the facade that decodes
+/// `SetColorModeResponse`, plugin-app-control lib.rs) →
+/// `BridgeMainThread::call_sync` — runs ON the ArkTS N-API main thread. The
+/// run_loop callbacks execute there (so `get_main_thread_env()` is `Some`;
+/// see the exit arm below), the `call_sync` Env-identity check
+/// (openharmony-ability bridge/mod.rs) rejects callers outside the active
+/// ArkTS environment, and worker callers are exactly what
+/// `call_sync_from_worker` exists for — set-color-mode does not use it. The
+/// ArkTS handler defers the actual `setColorMode` with `setTimeout(0)`, a
+/// LATER macrotask that cannot run while this synchronous dispatch blocks the
+/// main thread — an inline bounded poll would starve it and turn every
+/// `set_theme` into a false Err. So the completion is consumed here, at the
+/// start of every MainEvent dispatch (both notify legs wake the loop, so the
+/// drain runs promptly after the deferred tick reports). Consequence: the JS
+/// caller still sees the bridge's accepted=true → Ok for this call; a failure
+/// surfaces as the error log plus the override rollback (the honest Err for
+/// the JS caller would need the call chain moved off the main thread — a
+/// worker-migration rework, deliberately out of scope here).
+pub(crate) fn apply_color_mode_completion(completion: Option<bool>) -> bool {
+  match completion {
+    Some(false) => {
+      log::error!(
+        "[tao-ohos] setColorMode failed on the deferred ArkTS tick — rolling the theme override back to follow-system"
+      );
+      APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+      true
+    }
+    // Applied (or nothing new since the last drain): the override already
+    // reflects the intent for a success; None has nothing to apply.
+    _ => false,
+  }
+}
+
 /// Shared monitor_from_point: hit-test the point against every display's
 /// bounds in the global coordinate space (positions from ArkTS Display.x/y,
 /// issue Eulogizethesun/tauri#106 — previously only the default display's
@@ -1038,6 +1078,14 @@ impl<T: 'static> EventLoop<T> {
           }
         );
       }
+      // Issue Eulogizethesun/tauri#222: the deferred setColorMode completion
+      // (openharmony-ability COLOR_MODE_COMPLETION slot) is consumed here --
+      // the notify legs wake the loop, and an inline poll at the set_theme
+      // call site would starve (that call runs ON the ArkTS main thread; see
+      // apply_color_mode_completion for the full thread-model rationale).
+      // A reported failure rolls APP_THEME_OVERRIDE back to FOLLOW so
+      // theme() stops reporting an intent the system never applied.
+      apply_color_mode_completion(openharmony_ability::take_color_mode_completion());
       for (ohos_win_id, status) in openharmony_ability::drain_pending_window_status() {
         let ohos_win_id = ohos_win_id as i64;
         let mirror = {
@@ -1346,10 +1394,7 @@ impl<T: 'static> EventLoop<T> {
           let forward = scale_should_forward(composite);
           debug!(
             "ConfigChanged: font_size_scale={}, app.scale()={}, composite={}, forward={}",
-            font_scale,
-            density,
-            composite,
-            forward
+            font_scale, density, composite, forward
           );
           if forward {
             let app_rect = app.content_rect();
@@ -2806,5 +2851,56 @@ mod cursor_untracked_tests {
     );
     // Steady state: the latch stays tripped (the production steady state
     // after any untracked read).
+  }
+}
+
+// Issue Eulogizethesun/tauri#222 — appended at file end, keeps existing line
+// numbers. apply_color_mode_completion is pure apart from the
+// APP_THEME_OVERRIDE store, so the rollback arm is testable without a bridge
+// session. APP_THEME_OVERRIDE is a process global with no other test-side
+// writer today; these tests serialize on a dedicated lock and restore FOLLOW
+// so a future theme UT starts clean.
+#[cfg(test)]
+mod color_mode_completion_tests {
+  use super::*;
+
+  static APP_THEME_OVERRIDE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+  fn lock_override() -> std::sync::MutexGuard<'static, ()> {
+    APP_THEME_OVERRIDE_TEST_LOCK
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+  }
+
+  #[test]
+  fn ut_color_mode_failure_completion_rolls_override_back_to_follow() {
+    let _guard = lock_override();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_DARK, Ordering::Relaxed);
+    assert!(apply_color_mode_completion(Some(false)));
+    assert_eq!(
+      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
+      THEME_OVERRIDE_FOLLOW,
+      "a reported failure must stop theme() reporting an intent the system never applied"
+    );
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+  }
+
+  #[test]
+  fn ut_color_mode_success_and_empty_completions_leave_override_alone() {
+    let _guard = lock_override();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_LIGHT, Ordering::Relaxed);
+    // Success: the override already reflects the intent — untouched.
+    assert!(!apply_color_mode_completion(Some(true)));
+    assert_eq!(
+      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
+      THEME_OVERRIDE_LIGHT
+    );
+    // Nothing new since the last drain: untouched.
+    assert!(!apply_color_mode_completion(None));
+    assert_eq!(
+      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
+      THEME_OVERRIDE_LIGHT
+    );
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
   }
 }
