@@ -104,9 +104,11 @@ impl MonitorHandle {
       self.display_id,
       fallback_id
     );
-    // Same source chain as the default-display arm above: prefer the default
-    // display's live snapshot, then the app content_rect (pre-#106 behavior --
-    // DisplayManager query failure on old devices).
+    // Superset of the default-display arm above (which, having already tried
+    // this handle's own snapshot, goes straight to content_rect): re-query
+    // all_displays for the default display's LIVE snapshot first, then fall
+    // back to content_rect (pre-#106 behavior -- DisplayManager query failure
+    // on old devices).
     if let Some(default_display) = all_displays()
       .into_iter()
       .find(|display| display.id == fallback_id)

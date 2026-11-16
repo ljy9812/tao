@@ -77,13 +77,18 @@ pub trait WindowExtOpenHarmony {
   /// `Event::WindowEvent::Destroyed`: that confirmation channel serves the
   /// NON-main windows (sub-windows / spawned UIAbility instances — for the
   /// main window an Ok resolve is unreachable, so there is no re-emitted
-  /// `Destroyed` on that path). On a failed resolve tao warns and accounts the
-  /// id in the destroy-failure twin queue (`drain_destroy_failures`, re-export
-  /// below) so the runtime can clear its in-flight close guard; no Event is
-  /// emitted for a failure. Recursion-safe against the confirmation-driven
-  /// close flow: the loopback `CloseRequested` this eventually triggers finds
-  /// the runtime-side in-flight guard set and routes to the confirmation
-  /// executor.
+  /// `Destroyed` on that path). Failure has three legs: a window whose
+  /// `window_id()` is `None` (the creation handshake never settled) fails
+  /// before anything can be keyed — nothing is dispatched and that leg is
+  /// log-only, with no enqueue and no safe sentinel (0 is the main window's
+  /// REAL id) — a different situation from the id-0 rejection above; the
+  /// embedding runtime observes the None id directly at its initiate site,
+  /// which is where its in-flight close guard lives. A window whose bridge
+  /// client is unavailable is accounted per attempt, same as a failed resolve.
+  /// On a failed resolve tao warns and accounts the id in the destroy-failure
+  /// twin queue (`drain_destroy_failures`, re-export below) so the runtime can
+  /// clear its in-flight close guard; no Event is emitted for a failure.
+  /// Recursion-safe against the confirmation-driven close flow: the loopback
   fn close(&self);
 }
 
