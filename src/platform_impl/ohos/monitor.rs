@@ -9,8 +9,8 @@ use openharmony_ability::{all_displays, default_display, DisplaySnapshot, OpenHa
 ///
 /// The handle carries only the display id; accessors re-query the live display
 /// list, so hotplug (a display disappearing) degrades gracefully instead of
-/// serving stale geometry. `app` is kept for the default-display
-/// content-rect fallback in `size()`.
+/// serving stale geometry. `app` is kept for the default-display fallbacks in
+/// `size()` (content_rect) and `scale_factor()` (density).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MonitorHandle {
   app: OpenHarmonyApp,
@@ -88,11 +88,35 @@ impl MonitorHandle {
       let size = self.app.content_rect();
       return PhysicalSize::new(size.width as _, size.height as _);
     }
+    // Issue Eulogizethesun/tauri#132: a handle whose display has been
+    // disconnected (hotplug) serves the DEFAULT display's current size instead
+    // of 0x0 -- a window-position restoration consumer reading 0x0 would clamp
+    // to degenerate geometry (OHOS clamps negative/zero out-of-bounds to
+    // (0,0)), snapping the restored window to the top-left corner.
+    // CONSCIOUS DEVIATION from the desktop backends: windows/monitor.rs and
+    // macos/monitor.rs return 0x0 for a stale monitor handle (their
+    // MonitorHandle wraps a live OS object, so 0x0 there means "never use a
+    // stale handle"); the OHOS handle is a plain display id, so falling back to
+    // the default display keeps consumers within valid geometry.
+    let fallback_id = default_display();
     log::warn!(
-      "[tao ohos] no size for display {} (disconnected?); returning 0x0",
-      self.display_id
+      "[tao ohos] display {} disconnected; falling back to default display {} size",
+      self.display_id,
+      fallback_id
     );
-    PhysicalSize::new(0, 0)
+    // Same source chain as the default-display arm above: prefer the default
+    // display's live snapshot, then the app content_rect (pre-#106 behavior --
+    // DisplayManager query failure on old devices).
+    if let Some(default_display) = all_displays()
+      .into_iter()
+      .find(|display| display.id == fallback_id)
+    {
+      if default_display.width > 0 && default_display.height > 0 {
+        return PhysicalSize::new(default_display.width, default_display.height);
+      }
+    }
+    let size = self.app.content_rect();
+    PhysicalSize::new(size.width as _, size.height as _)
   }
 
   pub fn position(&self) -> PhysicalPosition<i32> {
