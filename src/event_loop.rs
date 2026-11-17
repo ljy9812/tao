@@ -246,6 +246,31 @@ impl<T> Deref for EventLoop<T> {
   }
 }
 
+/// Receipt closure for a deferred theme change (issue
+/// Eulogizethesun/tauri#264, design D2).
+///
+/// `set_theme_with_receipt` hands one receipt to the event loop alongside the
+/// theme change. On OHOS the actual `setColorMode` runs on a LATER ArkTS
+/// macrotask (`setTimeout(0)` in the plugin handler), so the bridge call
+/// itself can only report "accepted", not "applied". The event loop drains the
+/// deferred completion at the start of every `MainEvent` dispatch (the OHOS
+/// `apply_color_mode_completion` drain) and pops one receipt per completion,
+/// FIFO by arrival:
+///
+/// - `true` — the deferred ArkTS tick executed the color mode change;
+/// - `false` — the tick reported a failure; the override has already been
+///   rolled back to follow-system by the time the receipt fires, so the
+///   closure sees the honest state and the JS caller can surface a real Err.
+///
+/// The closure MUST swallow its own send failure (the awaiting command side
+/// times out and drops its receiver — that is a normal, non-fatal outcome),
+/// so invoking a receipt can never panic the event loop.
+///
+/// On platforms without the deferred-completion mechanism the alias exists
+/// (same shape on every target) but nothing accepts it: only the OHOS-gated
+/// `set_theme_with_receipt` method consumes receipts.
+pub type ThemeReceipt = Box<dyn FnOnce(bool) + Send + 'static>;
+
 impl<T> EventLoopWindowTarget<T> {
   /// Returns the list of all the monitors available on the system.
   #[inline]
@@ -341,6 +366,29 @@ impl<T> EventLoopWindowTarget<T> {
       target_env = "ohos",
     ))]
     self.p.set_theme(_theme)
+  }
+
+  /// Sets the theme for the application and hands the runtime one
+  /// [`ThemeReceipt`] that the event loop will fire with the deferred
+  /// completion verdict (`true` applied / `false` failed).
+  ///
+  /// Ordering discipline: the receipt is registered FIRST, then the full
+  /// existing `set_theme` pipeline runs on the same thread — so by the time
+  /// this call returns (and before any completion can be drained), the
+  /// receipt is already queued and can never be missed by a completion.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OHOS:** the deferred ArkTS `setColorMode` tick reports through the
+  ///   completion slot; one queued receipt is popped per drained completion,
+  ///   FIFO by arrival (see [`ThemeReceipt`]).
+  /// - **All other platforms:** unsupported (no deferred completion exists
+  ///   there); the method is absent so callers cannot queue a receipt that
+  ///   would never fire.
+  #[cfg(target_env = "ohos")]
+  #[inline]
+  pub fn set_theme_with_receipt(&self, theme: Option<Theme>, receipt: ThemeReceipt) {
+    self.p.set_theme_with_receipt(theme, receipt)
   }
 }
 

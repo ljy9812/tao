@@ -16,7 +16,7 @@ use openharmony_ability_plugin_app_control::{AppControlExt, ColorModeExt};
 use crate::dpi::{PhysicalPosition, PhysicalSize};
 use crate::error;
 use crate::event::{self, ElementState, Force, StartCause};
-use crate::event_loop::{self, ControlFlow};
+use crate::event_loop::{self, ControlFlow, ThemeReceipt};
 use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState};
 use crate::monitor;
 use crate::window::{self, Theme};
@@ -39,6 +39,28 @@ pub(crate) const THEME_OVERRIDE_LIGHT: u8 = 0;
 pub(crate) const THEME_OVERRIDE_DARK: u8 = 1;
 pub(crate) const THEME_OVERRIDE_FOLLOW: u8 = 2;
 pub(crate) static APP_THEME_OVERRIDE: AtomicU8 = AtomicU8::new(THEME_OVERRIDE_FOLLOW);
+
+/// FIFO queue of deferred set-theme receipts (issue Eulogizethesun/tauri#264,
+/// design D2). `set_theme_with_receipt` pushes one receipt BEFORE the theme
+/// change is applied, and every drained completion (see
+/// [`apply_color_mode_completion`]) pops exactly one receipt — FIFO by
+/// arrival — and fires it with the verdict.
+///
+/// Ownership semantics (the honest boundary, keep in sync with the facade
+/// doc): the pairing is by ARRIVAL ORDER, not by call identity. Completion
+/// producers that do NOT carry a receipt — the native Rust `set_theme` and
+/// any window-level setTheme path — still emit completions into the shared
+/// slot; when such a bare completion drains while a JS caller's receipt is
+/// queued, the receipt is woken by the wrong verdict (off by one slot). Root
+/// fix = a call-id on the setColorMode wire so completions can be matched to
+/// their own receipt — future item, tracked in issue Eulogizethesun/tauri#264.
+///
+/// `Mutex::new` is const (Rust 1.63+, above this crate's 1.74 MSRV), so the
+/// queue needs no LazyLock; poison recovery follows the same
+/// `poisoned.into_inner()` discipline as the test lock below (a receipt
+/// panicking must not wedge the queue for later callers).
+static THEME_RECEIPTS: std::sync::Mutex<VecDeque<ThemeReceipt>> =
+  std::sync::Mutex::new(VecDeque::new());
 
 /// Effective theme (override if set, else system color_mode) encoded for the
 /// ThemeChanged dispatch guard (issue Eulogizethesun/tauri#108). u8 pairs with
@@ -389,6 +411,30 @@ pub(crate) fn set_app_theme(app: &OpenHarmonyApp, theme: Option<Theme>) {
   }
 }
 
+/// Queues one receipt for the NEXT drained completion (issue
+/// Eulogizethesun/tauri#264, design D2). Called by
+/// `EventLoopWindowTarget::set_theme_with_receipt` BEFORE
+/// [`set_app_theme`] applies the change, on the same thread — the registration
+/// is synchronous and can never be overtaken by a completion, because
+/// completions are only consumed by [`apply_color_mode_completion`] at the
+/// `MainEvent` dispatch head, which this thread cannot re-enter mid-call.
+pub(crate) fn register_theme_receipt(receipt: ThemeReceipt) {
+  let mut queue = THEME_RECEIPTS
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  queue.push_back(receipt);
+}
+
+/// Pops exactly one receipt, FIFO by arrival (`None` when no receipt is
+/// queued — a bare completion, e.g. from the native Rust `set_theme`, wakes
+/// nobody). Poison recovery matches [`register_theme_receipt`].
+fn pop_theme_receipt() -> Option<ThemeReceipt> {
+  let mut queue = THEME_RECEIPTS
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  queue.pop_front()
+}
+
 /// Issue Eulogizethesun/tauri#222 drain leg: applies ONE deferred setColorMode
 /// completion (the `openharmony_ability::take_color_mode_completion()` slot —
 /// `Some(true)` executed, `Some(false)` failed, `None` nothing new). Returns
@@ -414,6 +460,24 @@ pub(crate) fn set_app_theme(app: &OpenHarmonyApp, theme: Option<Theme>) {
 /// surfaces as the error log plus the override rollback (the honest Err for
 /// the JS caller would need the call chain moved off the main thread — a
 /// worker-migration rework, deliberately out of scope here).
+///
+/// Issue Eulogizethesun/tauri#264 (design D2) extends the drain with the
+/// receipt channel: `set_theme_with_receipt` queued a
+/// [`ThemeReceipt`] BEFORE applying the change, and EVERY completion
+/// carrying a verdict pops exactly one queued receipt — FIFO by arrival —
+/// and fires it with that verdict (`true` applied, `false` failed). The
+/// pairing is by arrival order, not call identity: a bare completion (from
+/// the native Rust `set_theme` or a window-level setTheme) drains while a
+/// JS receipt is queued wakes that receipt with the wrong verdict — the
+/// disclosed off-by-one limitation; root fix = call-id on the wire (future
+/// item, issue #264; see THEME_RECEIPTS). `None` carries no verdict and
+/// deliberately pops nothing, so a queued receipt is only ever woken by a
+/// completion that actually carries one. Failure ordering: the override is
+/// rolled back to FOLLOW FIRST and the receipt fires afterwards — the JS
+/// caller learns of the failure only once the honest (rolled-back) state is
+/// already in effect. The receipt closure itself owns its send-failure
+/// swallowing (the awaiting command side times out and drops its receiver:
+/// a normal outcome), so firing it here cannot panic.
 pub(crate) fn apply_color_mode_completion(completion: Option<bool>) -> bool {
   match completion {
     Some(false) => {
@@ -421,11 +485,24 @@ pub(crate) fn apply_color_mode_completion(completion: Option<bool>) -> bool {
         "[tao-ohos] setColorMode failed on the deferred ArkTS tick — rolling the theme override back to follow-system"
       );
       APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+      // AFTER the rollback: the receipt is the JS caller's failure signal,
+      // and it must observe the already-rolled-back override.
+      if let Some(receipt) = pop_theme_receipt() {
+        receipt(false);
+      }
       true
     }
-    // Applied (or nothing new since the last drain): the override already
-    // reflects the intent for a success; None has nothing to apply.
-    _ => false,
+    // Applied: the override already reflects the intent — hand the deferred
+    // caller its success.
+    Some(true) => {
+      if let Some(receipt) = pop_theme_receipt() {
+        receipt(true);
+      }
+      false
+    }
+    // Nothing new since the last drain: no verdict, no receipt wake, no
+    // override change.
+    None => false,
   }
 }
 
@@ -1675,6 +1752,19 @@ impl<T: 'static> EventLoopWindowTarget<T> {
   pub fn set_theme(&self, theme: Option<Theme>) {
     set_app_theme(&self.app, theme);
   }
+
+  /// Issue Eulogizethesun/tauri#264 (design D2): [`Self::set_theme`] plus a
+  /// receipt the runtime handed over for the deferred completion. Register
+  /// FIRST, then run the full existing `set_theme` pipeline — same thread,
+  /// so the receipt is queued before any completion can possibly be drained
+  /// (the drain runs at the `MainEvent` dispatch head,
+  /// [`apply_color_mode_completion`], which this synchronous call cannot
+  /// re-enter). The pre-existing [`Self::set_theme`] keeps its exact
+  /// no-receipt behavior (bare completions wake nobody).
+  pub fn set_theme_with_receipt(&self, theme: Option<Theme>, receipt: ThemeReceipt) {
+    register_theme_receipt(receipt);
+    set_app_theme(&self.app, theme);
+  }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -2902,5 +2992,370 @@ mod color_mode_completion_tests {
       THEME_OVERRIDE_LIGHT
     );
     APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+  }
+
+  // ---- Issue Eulogizethesun/tauri#264 (design D2) receipt-channel tests ----
+  // THEME_RECEIPTS is a process global exactly like APP_THEME_OVERRIDE, so
+  // every test below runs under the same APP_THEME_OVERRIDE_TEST_LOCK and
+  // clears the queue on entry (idempotent reset: a previously failed run
+  // must not leak receipts into the next test's FIFO assertions).
+
+  fn clear_receipt_queue() {
+    THEME_RECEIPTS
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .clear();
+  }
+
+  fn pending_receipt_count() -> usize {
+    THEME_RECEIPTS
+      .lock()
+      .unwrap_or_else(|poisoned| poisoned.into_inner())
+      .len()
+  }
+
+  /// UT for the D2 failure leg: one failure completion pops the queued
+  /// receipt exactly once, fires it with `false`, and does so AFTER the
+  /// override rollback.
+  ///
+  /// # Brief
+  /// 1. lock + clear queue; override := DARK.
+  /// 2. register one receipt recording (verdict, override-at-fire).
+  /// 3. drain Some(false): return true, receipt fired exactly once with
+  ///    false, override-at-fire already FOLLOW, final override FOLLOW.
+  #[test]
+  fn ut_theme_receipt_failure_fires_false_after_rollback() {
+    let _guard = lock_override();
+    clear_receipt_queue();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_DARK, Ordering::Relaxed);
+    let fired: std::sync::Arc<std::sync::Mutex<Vec<(bool, u8)>>> =
+      std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&fired);
+    register_theme_receipt(Box::new(move |applied| {
+      sink
+        .lock()
+        .unwrap()
+        .push((applied, APP_THEME_OVERRIDE.load(Ordering::Relaxed)));
+    }));
+
+    assert!(apply_color_mode_completion(Some(false)));
+    let fired = fired.lock().unwrap();
+    assert_eq!(
+      fired.len(),
+      1,
+      "one failure completion must fire the receipt exactly once"
+    );
+    assert_eq!(
+      fired[0].0, false,
+      "the receipt must carry the failure verdict"
+    );
+    assert_eq!(
+      fired[0].1, THEME_OVERRIDE_FOLLOW,
+      "the rollback must land BEFORE the receipt fires (JS learns of the failure only after the honest state is restored)"
+    );
+    drop(fired);
+    assert_eq!(
+      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
+      THEME_OVERRIDE_FOLLOW
+    );
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    clear_receipt_queue();
+  }
+
+  /// UT for the D2 success leg: one success completion pops the queued
+  /// receipt with `true` and leaves the override untouched.
+  ///
+  /// # Brief
+  /// 1. lock + clear queue; override := LIGHT.
+  /// 2. register one receipt recording (verdict, override-at-fire).
+  /// 3. drain Some(true): return false, receipt fired exactly once with
+  ///    true, override still LIGHT at fire time and afterwards.
+  #[test]
+  fn ut_theme_receipt_success_fires_true_keeps_override() {
+    let _guard = lock_override();
+    clear_receipt_queue();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_LIGHT, Ordering::Relaxed);
+    let fired: std::sync::Arc<std::sync::Mutex<Vec<(bool, u8)>>> =
+      std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&fired);
+    register_theme_receipt(Box::new(move |applied| {
+      sink
+        .lock()
+        .unwrap()
+        .push((applied, APP_THEME_OVERRIDE.load(Ordering::Relaxed)));
+    }));
+
+    assert!(!apply_color_mode_completion(Some(true)));
+    let fired = fired.lock().unwrap();
+    assert_eq!(
+      fired.len(),
+      1,
+      "one success completion must fire the receipt exactly once"
+    );
+    assert_eq!(
+      fired[0].0, true,
+      "the receipt must carry the success verdict"
+    );
+    assert_eq!(
+      fired[0].1, THEME_OVERRIDE_LIGHT,
+      "a success completion must not touch the override"
+    );
+    drop(fired);
+    assert_eq!(
+      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
+      THEME_OVERRIDE_LIGHT
+    );
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    clear_receipt_queue();
+  }
+
+  /// UT for the bare-completion regression guard: with no receipt queued, a
+  /// failure completion keeps the exact legacy behavior (rollback only, no
+  /// wake) and the queue stays empty — the drain must not conjure or retain
+  /// a phantom receipt.
+  ///
+  /// # Brief
+  /// 1. lock + clear queue; override := DARK; register nothing.
+  /// 2. drain Some(false): return true, override FOLLOW, queue len 0.
+  #[test]
+  fn ut_theme_receipt_failure_without_receipt_keeps_legacy_rollback() {
+    let _guard = lock_override();
+    clear_receipt_queue();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_DARK, Ordering::Relaxed);
+
+    assert!(apply_color_mode_completion(Some(false)));
+    assert_eq!(
+      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
+      THEME_OVERRIDE_FOLLOW
+    );
+    assert_eq!(
+      pending_receipt_count(),
+      0,
+      "a bare completion must not create or retain a receipt"
+    );
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    clear_receipt_queue();
+  }
+
+  /// UT for the None leg: a drain carrying no completion must neither wake
+  /// nor drop the queued receipt — it stays pending for a later verdict (no
+  /// false wake).
+  ///
+  /// # Brief
+  /// 1. lock + clear queue; register one receipt.
+  /// 2. drain None twice: both return false, the receipt never fires and
+  ///    stays queued (len 1) after each drain.
+  #[test]
+  fn ut_theme_receipt_none_completion_leaves_receipt_pending() {
+    let _guard = lock_override();
+    clear_receipt_queue();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    let fired: std::sync::Arc<std::sync::Mutex<Vec<bool>>> =
+      std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&fired);
+    register_theme_receipt(Box::new(move |applied| {
+      sink.lock().unwrap().push(applied);
+    }));
+
+    assert!(!apply_color_mode_completion(None));
+    assert!(
+      fired.lock().unwrap().is_empty(),
+      "a None drain must not wake the queued receipt"
+    );
+    assert_eq!(
+      pending_receipt_count(),
+      1,
+      "a None drain must not drop the queued receipt"
+    );
+    assert!(!apply_color_mode_completion(None));
+    assert!(fired.lock().unwrap().is_empty());
+    assert_eq!(pending_receipt_count(), 1);
+
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    clear_receipt_queue();
+  }
+
+  /// UT for FIFO pairing: two receipts registered in order pair with two
+  /// completions in completion order — first-queued fires first, the second
+  /// stays pending until its own completion.
+  ///
+  /// # Brief
+  /// 1. lock + clear queue; override := DARK; register receipts 0 and 1
+  ///    (each records its index + verdict into one shared log).
+  /// 2. drain Some(false): only receipt 0 fires with false.
+  /// 3. drain Some(true): only receipt 1 fires with true.
+  #[test]
+  fn ut_theme_receipt_fifo_pairs_receipts_in_completion_order() {
+    let _guard = lock_override();
+    clear_receipt_queue();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_DARK, Ordering::Relaxed);
+    let fired: std::sync::Arc<std::sync::Mutex<Vec<(usize, bool)>>> =
+      std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    for receipt_index in 0..2usize {
+      let sink = std::sync::Arc::clone(&fired);
+      register_theme_receipt(Box::new(move |applied| {
+        sink.lock().unwrap().push((receipt_index, applied));
+      }));
+    }
+
+    assert!(apply_color_mode_completion(Some(false)));
+    assert_eq!(
+      fired.lock().unwrap().as_slice(),
+      &[(0usize, false)],
+      "the first completion must wake the FIRST-queued receipt only"
+    );
+
+    assert!(!apply_color_mode_completion(Some(true)));
+    assert_eq!(
+      fired.lock().unwrap().as_slice(),
+      &[(0usize, false), (1usize, true)],
+      "the second completion must wake the second-queued receipt with the success verdict"
+    );
+
+    assert_eq!(
+      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
+      THEME_OVERRIDE_FOLLOW
+    );
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    clear_receipt_queue();
+  }
+
+  /// UT for exactly-one-pop: each completion pops exactly one receipt — no
+  /// double-fire within a completion, no leak across completions, queue
+  /// drains one by one.
+  ///
+  /// # Brief
+  /// 1. lock + clear queue; override := DARK; register receipts 0/1/2 into
+  ///    one shared log.
+  /// 2. drain Some(true) twice: after each, exactly one new fire and the
+  ///    pending count drops 3 -> 2 -> 1.
+  /// 3. drain Some(false): receipt 2 fires with false, queue empty, override
+  ///    rolled back; every receipt fired exactly once in total.
+  #[test]
+  fn ut_theme_receipt_each_completion_pops_exactly_one() {
+    let _guard = lock_override();
+    clear_receipt_queue();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_DARK, Ordering::Relaxed);
+    let fired: std::sync::Arc<std::sync::Mutex<Vec<(usize, bool)>>> =
+      std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    for receipt_index in 0..3usize {
+      let sink = std::sync::Arc::clone(&fired);
+      register_theme_receipt(Box::new(move |applied| {
+        sink.lock().unwrap().push((receipt_index, applied));
+      }));
+    }
+
+    assert!(!apply_color_mode_completion(Some(true)));
+    assert_eq!(
+      fired.lock().unwrap().as_slice(),
+      &[(0usize, true)],
+      "the first completion must pop exactly one receipt"
+    );
+    assert_eq!(pending_receipt_count(), 2);
+
+    assert!(!apply_color_mode_completion(Some(true)));
+    assert_eq!(
+      fired.lock().unwrap().as_slice(),
+      &[(0usize, true), (1usize, true)],
+      "the second completion must pop exactly one more receipt"
+    );
+    assert_eq!(pending_receipt_count(), 1);
+
+    assert!(apply_color_mode_completion(Some(false)));
+    assert_eq!(
+      fired.lock().unwrap().as_slice(),
+      &[(0usize, true), (1usize, true), (2usize, false)],
+      "the third completion must pop the last receipt with the failure verdict"
+    );
+    assert_eq!(pending_receipt_count(), 0);
+
+    let fired = fired.lock().unwrap();
+    for receipt_index in 0..3usize {
+      assert_eq!(
+        fired.iter().filter(|(i, _)| *i == receipt_index).count(),
+        1,
+        "receipt {receipt_index} must fire exactly once (no double-fire, no leak)"
+      );
+    }
+    drop(fired);
+    assert_eq!(
+      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
+      THEME_OVERRIDE_FOLLOW
+    );
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    clear_receipt_queue();
+  }
+
+  /// UT for the register-first discipline: `set_theme_with_receipt` queues
+  /// the receipt EAGERLY — by the time the call returns (and therefore
+  /// before any completion can be drained) the receipt is already queued —
+  /// and still applies the theme change; the receipt's own override-at-fire
+  /// probe shows the applied state.
+  ///
+  /// # Brief
+  /// 1. lock + clear queue; override := FOLLOW.
+  /// 2. build a bare EventLoopWindowTarget (a UT process has no ArkTS main
+  ///    thread env, so set_app_theme stores the override and skips the
+  ///    bridge call — exactly the state these tests run in).
+  /// 3. set_theme_with_receipt(Some(Dark), probe): queue already holds the
+  ///    receipt, override already DARK, receipt NOT yet fired.
+  /// 4. drain Some(true): receipt fires exactly once with true and reads
+  ///    override DARK.
+  ///
+  /// Register-BEFORE-apply within the method itself is not externally
+  /// observable (the synchronous call cannot be re-entered by a completion
+  /// drain); what this test pins is the externally load-bearing half: the
+  /// registration is eager, not deferred to the drain — a receipt registered
+  /// lazily would read queue-len 0 here and miss its completion.
+  #[test]
+  fn ut_set_theme_with_receipt_registers_eagerly_before_apply() {
+    let _guard = lock_override();
+    clear_receipt_queue();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    let target = EventLoopWindowTarget::<()> {
+      app: OpenHarmonyApp::new(),
+      bridge_executor: BridgeExecutor::new(),
+      exit: Cell::new(false),
+      _marker: PhantomData,
+    };
+    let fired: std::sync::Arc<std::sync::Mutex<Vec<(bool, u8)>>> =
+      std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&fired);
+    target.set_theme_with_receipt(
+      Some(Theme::Dark),
+      Box::new(move |applied| {
+        sink
+          .lock()
+          .unwrap()
+          .push((applied, APP_THEME_OVERRIDE.load(Ordering::Relaxed)));
+      }),
+    );
+
+    assert_eq!(
+      pending_receipt_count(),
+      1,
+      "the receipt must already be queued when set_theme_with_receipt returns (eager registration, not drain-time)"
+    );
+    assert_eq!(
+      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
+      THEME_OVERRIDE_DARK,
+      "set_app_theme must still run the full existing set_theme pipeline"
+    );
+    assert!(
+      fired.lock().unwrap().is_empty(),
+      "queueing must not fire the receipt"
+    );
+
+    assert!(!apply_color_mode_completion(Some(true)));
+    let fired = fired.lock().unwrap();
+    assert_eq!(
+      fired.as_slice(),
+      &[(true, THEME_OVERRIDE_DARK)],
+      "the completion wakes the receipt with the success verdict and the applied override state"
+    );
+    drop(fired);
+    assert_eq!(pending_receipt_count(), 0);
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    clear_receipt_queue();
   }
 }
