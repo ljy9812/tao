@@ -262,6 +262,13 @@ impl<T> Deref for EventLoop<T> {
 ///   rolled back to follow-system by the time the receipt fires, so the
 ///   closure sees the honest state and the JS caller can surface a real Err.
 ///
+/// Pairing is by arrival order, not call identity: a bare completion (native
+/// `set_theme`, window-level setTheme) or a second concurrent receipted JS
+/// call can wake a queued receipt with the other call's verdict — the second
+/// receipt then starves until its command-side timeout. Disclosed limitation;
+/// root fix = a call-id on the setColorMode wire (issue
+/// Eulogizethesun/tauri#264).
+///
 /// The closure MUST swallow its own send failure (the awaiting command side
 /// times out and drops its receiver — that is a normal, non-fatal outcome),
 /// so invoking a receipt can never panic the event loop.

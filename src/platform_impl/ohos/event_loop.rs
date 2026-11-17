@@ -51,9 +51,14 @@ pub(crate) static APP_THEME_OVERRIDE: AtomicU8 = AtomicU8::new(THEME_OVERRIDE_FO
 /// producers that do NOT carry a receipt — the native Rust `set_theme` and
 /// any window-level setTheme path — still emit completions into the shared
 /// slot; when such a bare completion drains while a JS caller's receipt is
-/// queued, the receipt is woken by the wrong verdict (off by one slot). Root
-/// fix = a call-id on the setColorMode wire so completions can be matched to
-/// their own receipt — future item, tracked in issue Eulogizethesun/tauri#264.
+/// queued, the receipt is woken by the wrong verdict (off by one slot). The
+/// same slot-sharing also collapses two CONCURRENT receipted JS calls: both
+/// receipts queue, but the single `take_color_mode_completion` slot merges
+/// their deferred ticks, so the first-queued receipt can receive the other
+/// call's verdict and the second receipt starves until its command-side
+/// timeout fires. Root fix for both forms = a call-id on the setColorMode
+/// wire so completions can be matched to their own receipt — future item,
+/// tracked in issue Eulogizethesun/tauri#264.
 ///
 /// `Mutex::new` is const (Rust 1.63+, above this crate's 1.74 MSRV), so the
 /// queue needs no LazyLock; poison recovery follows the same
@@ -469,8 +474,11 @@ fn pop_theme_receipt() -> Option<ThemeReceipt> {
 /// pairing is by arrival order, not call identity: a bare completion (from
 /// the native Rust `set_theme` or a window-level setTheme) drains while a
 /// JS receipt is queued wakes that receipt with the wrong verdict — the
-/// disclosed off-by-one limitation; root fix = call-id on the wire (future
-/// item, issue #264; see THEME_RECEIPTS). `None` carries no verdict and
+/// disclosed off-by-one limitation; two CONCURRENT receipted JS calls share
+/// the same single completion slot, so the first-queued receipt can receive
+/// the other call's verdict while the second starves until its command-side
+/// timeout. Root fix for both forms = call-id on the wire (future item,
+/// issue #264; see THEME_RECEIPTS). `None` carries no verdict and
 /// deliberately pops nothing, so a queued receipt is only ever woken by a
 /// completion that actually carries one. Failure ordering: the override is
 /// rolled back to FOLLOW FIRST and the receipt fires afterwards — the JS
