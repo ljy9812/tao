@@ -1977,6 +1977,18 @@ impl Window {
   /// USER-initiated CloseRequested is misread as the destruction loopback).
   /// The bridge-client-unavailable leg accounts the same way; the no-OHOS-id
   /// leg is log-only (nothing to key the record on -- see the arm below).
+  ///
+  /// Residual boundary of that accounting (disclosed, not fixed -- issue
+  /// Eulogizethesun/tauri#255 review): the bridge-client-unavailable leg (b)
+  /// enqueues synchronously at call time, but the async-failure leg (c)
+  /// enqueues from inside the future spawned through
+  /// [`Self::spawn_or_queue`] -- its enqueue+wake happen only when the
+  /// executor actually polls that queued future. If the executor never runs
+  /// it (bridge never recovers AND the pending queue never drains -- an
+  /// app-level wedged state), the stale in-flight close guard survives and
+  /// the next USER-initiated CloseRequested is still misread as the
+  /// destruction loopback. Guard-clearing is therefore "once the loop is
+  /// alive again", not unconditional at call time.
   pub fn close(&self) {
     let Some(window_id) = self.window_id else {
       // Failure leg (a): no OHOS id -- the creation handshake never settled,
