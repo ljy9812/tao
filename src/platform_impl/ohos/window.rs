@@ -228,9 +228,12 @@ pub(crate) fn drain_destroy_confirmations() -> Vec<i64> {
 
 /// Failure twin of [`DESTROY_CONFIRMATIONS`] (issue Eulogizethesun/tauri#255):
 /// destroy requests this process issued through [`Window::close`] that FAILED
-/// to reach the bridge -- (b) the window's bridge client is unavailable, and
-/// (c) the async `destroy_window` resolve returned Err. (a) A window with no
-/// OHOS id (`window_id == None`) fails before anything can be keyed: there is
+/// -- (b) the window's bridge client is unavailable, so the request never
+/// left this process, and (c) the async `destroy_window` resolve returned
+/// Err, i.e. the request DID reach the bridge and the ArkTS handler ran and
+/// failed. (a) A window with no
+/// OHOS id (`window_id == None`) is a defensive leg (unreachable today: every
+/// `Window::new` branch assigns an id before the `Window` exists) — there is
 /// no id to enqueue, so that path stays a log-only failure -- the embedding
 /// runtime can observe the None id directly at its initiate site
 /// (`WindowExtOpenHarmony::window_id()`), which is where its in-flight close
@@ -244,8 +247,15 @@ pub(crate) fn drain_destroy_confirmations() -> Vec<i64> {
 /// window that is still alive). tao itself announces nothing: no Event variant
 /// is added -- the failure is "accounted, not announced" and the runtime owns
 /// the guard (design D3 keeps tao's failed resolve silent on the event lane).
-/// Enqueue happens on the dispatching thread (main thread or bridge executor);
-/// the drain runs on the embedding runtime's thread -- hence the mutex.
+/// Enqueue happens on the caller's thread for (b) (wherever `close()` was
+/// called), and for (c) inside the spawned future on the bridge executor --
+/// or, if the queued future is discarded before it can run
+/// ([`drop_pending_window_ops`]: handle drop, spawn rollback), at discard time
+/// via the future's [`DestroyAccountingGuard`] Drop guard; the drain
+/// runs on the embedding runtime's thread -- hence the mutex. One RECORD per
+/// failed attempt: a window whose close fails repeatedly enqueues one entry
+/// per attempt (the runtime's drain side ignores ids with no live guard --
+/// its no-op path).
 pub(crate) static DESTROY_FAILURES: std::sync::LazyLock<std::sync::Mutex<Vec<i64>>> =
   std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
@@ -258,9 +268,12 @@ pub(crate) fn enqueue_destroy_failure(window_id: i64) {
 
 /// Drains the failure twin of the destroy-confirmation queue: the OHOS window
 /// ids whose `close()`-dispatched `destroy-window` bridge call failed (bridge
-/// client unavailable, or the async resolve returned Err -- see
-/// [`DESTROY_FAILURES`]). Consuming read: each id is returned exactly once.
-/// Exported for the embedding runtime (tauri-runtime-wry), which pairs it with
+/// client unavailable, the async resolve returned Err, or the future discarded
+/// before running -- see [`DESTROY_FAILURES`]). Consuming read: each enqueued
+/// RECORD is returned exactly once; a window that fails `close()` repeatedly
+/// enqueues one record per attempt (ids without a live in-flight guard are
+/// ignored by the drain side — its no-op path). Exported for the embedding
+/// runtime (tauri-runtime-wry), which pairs it with
 /// its own in-flight close guard; tao never drains it itself.
 pub fn drain_destroy_failures() -> Vec<i64> {
   std::mem::take(
@@ -268,6 +281,54 @@ pub fn drain_destroy_failures() -> Vec<i64> {
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner()),
   )
+}
+
+/// tao#31 review T31-5: a queued destroy future that is DISCARDED before it
+/// can run must still perform leg (c)'s accounting. `Window::close` wraps its
+/// future in one of these: the future disarms the guard as soon as it starts
+/// executing (its own terminal arms — Ok confirmation / Err failure — do
+/// their own enqueue+wake), so a normally-run future never double-accounts;
+/// dropping the future while still armed — `drop_pending_window_ops`
+/// discarded the unspawned queue entry (handle drop, spawn rollback) —
+/// performs the same enqueue_destroy_failure + wake that leg (b) performs,
+/// so the runtime's in-flight close guard is cleared on the discard path
+/// too. A future dropped while suspended mid-await over-accounts one failure
+/// record; the drain side ignores ids with no live guard, so that is
+/// absorbed.
+struct DestroyAccountingGuard {
+  window_id: i64,
+  armed: bool,
+  app: OpenHarmonyApp,
+}
+
+impl DestroyAccountingGuard {
+  fn new(window_id: i64, app: OpenHarmonyApp) -> Self {
+    Self {
+      window_id,
+      armed: true,
+      app,
+    }
+  }
+
+  /// Disarm (called at the head of the future, before any await): from here
+  /// on the terminal arms of the future own their own accounting. Consuming
+  /// `self` with `armed` cleared makes the imminent Drop a no-op.
+  fn disarm(mut self) {
+    self.armed = false;
+  }
+}
+
+impl Drop for DestroyAccountingGuard {
+  fn drop(&mut self) {
+    if self.armed {
+      log::info!(
+        "[tao-ohos] destroy future for window {} discarded before running — accounting the failure via the Drop guard (handle dropped or spawn rolled back)",
+        self.window_id
+      );
+      enqueue_destroy_failure(self.window_id);
+      self.app.create_waker().wake();
+    }
+  }
 }
 
 /// Writes the per-window focused bit (#173) through [`WINDOW_MIRRORS`].
@@ -1959,7 +2020,8 @@ impl Window {
   /// Destroys the OS-level window: sub-windows call `destroyWindow`.
   /// The main (UIAbility) window is system-managed: the bridge's
   /// `destroy-window` handler rejects window id 0, so for the main window
-  /// this is a rejected fire-and-forget (logged as a warning) — the ability
+  /// this is a rejected fire-and-forget — the failure is WARNED and ACCOUNTED
+  /// (see below), not merely logged — the ability
   /// is terminated by the system, not by an in-app close. Fire-and-forget
   /// through the bridge executor, same as the other async window operations.
   ///
@@ -1975,43 +2037,59 @@ impl Window {
   /// queue) and the loop is woken, so the runtime can drain it and clear the
   /// in-flight close guard it set before dispatching (otherwise the next
   /// USER-initiated CloseRequested is misread as the destruction loopback).
-  /// The bridge-client-unavailable leg accounts the same way; the no-OHOS-id
+  /// The bridge-client-unavailable leg accounts the same way, on the
+  /// caller's thread; the no-OHOS-id
   /// leg is log-only (nothing to key the record on -- see the arm below).
   ///
   /// Residual boundary of that accounting (disclosed, not fixed -- issue
-  /// Eulogizethesun/tauri#255 review): the bridge-client-unavailable leg (b)
-  /// enqueues synchronously at call time, but the async-failure leg (c)
-  /// enqueues from inside the future spawned through
-  /// [`Self::spawn_or_queue`] -- its enqueue+wake happen only when the
-  /// executor actually polls that queued future. If the executor never runs
-  /// it (bridge never recovers AND the pending queue never drains -- an
-  /// app-level wedged state), the stale in-flight close guard survives and
-  /// the next USER-initiated CloseRequested is still misread as the
-  /// destruction loopback. Guard-clearing is therefore "once the loop is
-  /// alive again", not unconditional at call time.
+  /// Eulogizethesun/tauri#255 review): the future discarded before it can
+  /// run ([`drop_pending_window_ops`]: `Drop for Window`, or the
+  /// `start_ui_ability` Err rollback in `Window::new`) IS covered — its
+  /// [`DestroyAccountingGuard`] Drop performs the enqueue+wake at discard
+  /// time. What remains uncovered: leg (c)'s future spawned onto the bridge
+  /// executor but never POLLED — a runtime that wedges after spawn (bridge
+  /// never recovers AND the executor never runs again -- an app-level wedged
+  /// state) leaves the stale in-flight close guard in place, and the next
+  /// USER-initiated CloseRequested is still misread as the destruction
+  /// loopback. Guard-clearing is therefore "once the executor runs the
+  /// future (or discards it)", not unconditional at call time.
   pub fn close(&self) {
     let Some(window_id) = self.window_id else {
-      // Failure leg (a): no OHOS id -- the creation handshake never settled,
-      // so nothing was dispatched and there is no id to key a
+      // Failure leg (a) — DEFENSIVE, unreachable today: every `Window::new`
+      // branch assigns an id before the `Window` exists (bootstrap 0,
+      // `next_window_id`, or the `create_os_window` pre-allocation); a
+      // synchronous failure returns Err and never constructs a `Window`, and
+      // the async spawn failure rolls back with the id already assigned. The
+      // arm stays because `window_id` is an `Option` the runtime can observe
+      // at its initiate site (WindowExtOpenHarmony::window_id()) and close()
+      // must stay total: nothing was dispatched and there is no id to key a
       // DESTROY_FAILURES record on (0 is the main window's REAL id, so no
-      // sentinel is safe; the embedding runtime can observe the None id
-      // directly at its initiate site via WindowExtOpenHarmony::window_id()).
+      // sentinel is safe).
       log::warn!(
-        "close: window has no OHOS id (creation handshake never settled) — nothing dispatched"
+        "close: window has no OHOS id (defensive leg — creation handshake never settled) — nothing dispatched"
       );
       return;
     };
     let Some(client) = self.bridge_client("close") else {
       // Failure leg (b): bridge client unavailable. The shared degradation
       // warn (bridge_client_cached_or_refetch) fired debounced; this leg is
-      // accounted per attempt so the runtime's in-flight close guard is
-      // cleared even when the bridge never comes back.
+      // accounted per attempt, ON THE CALLER'S THREAD, so the runtime's
+      // in-flight close guard is cleared even when the bridge never comes
+      // back.
       enqueue_destroy_failure(window_id);
       self.app.create_waker().wake();
       return;
     };
     let app = self.app.clone();
+    // T31-5: arm the discard guard BEFORE queueing — if this future is
+    // dropped before it can run (drop_pending_window_ops: handle drop or
+    // spawn rollback), its Drop performs the failure accounting the Err arm
+    // would have performed.
+    let guard = DestroyAccountingGuard::new(window_id, self.app.clone());
     self.spawn_or_queue(async move {
+      // The future is executing: its own terminal arms (Ok confirmation /
+      // Err failure, both enqueue+wake) own the accounting from here.
+      guard.disarm();
       match client.destroy_window(window_id).await {
         Ok(()) => {
           enqueue_destroy_confirmation(window_id);
@@ -2814,7 +2892,11 @@ impl Window {
   }
 
   pub fn set_theme(&self, theme: Option<Theme>) {
-    set_app_theme(&self.app, theme);
+    // Bare call (no receipt): keep the legacy contract — the intent mirror
+    // stands even when the bridge call is rejected; log the reason only.
+    if let Err(reason) = set_app_theme(&self.app, theme) {
+      log::warn!("[tao-ohos] set_theme: bridge call not accepted (bare, intent kept): {}", reason);
+    }
   }
 
   pub fn title(&self) -> String {

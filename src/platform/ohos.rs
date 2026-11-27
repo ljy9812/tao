@@ -78,17 +78,29 @@ pub trait WindowExtOpenHarmony {
   /// NON-main windows (sub-windows / spawned UIAbility instances — for the
   /// main window an Ok resolve is unreachable, so there is no re-emitted
   /// `Destroyed` on that path). Failure has three legs: a window whose
-  /// `window_id()` is `None` (the creation handshake never settled) fails
-  /// before anything can be keyed — nothing is dispatched and that leg is
-  /// log-only, with no enqueue and no safe sentinel (0 is the main window's
-  /// REAL id) — a different situation from the id-0 rejection above; the
-  /// embedding runtime observes the None id directly at its initiate site,
-  /// which is where its in-flight close guard lives. A window whose bridge
-  /// client is unavailable is accounted per attempt, same as a failed resolve.
+  /// `window_id()` is `None` — a DEFENSIVE leg: every `Window::new` branch
+  /// assigns an id before the `Window` exists (bootstrap 0, `next_window_id`,
+  /// or the `create_os_window` pre-allocation; synchronous failures return
+  /// `Err` and never construct a `Window`, and an async spawn failure rolls
+  /// back with the id already assigned), so this arm cannot fire today —
+  /// fails before anything can be keyed; nothing is dispatched and that leg
+  /// is log-only, with no enqueue and no safe sentinel (0 is the main
+  /// window's REAL id); the embedding runtime observes the None id directly
+  /// at its initiate site, which is where its in-flight close guard lives.
+  /// A window whose bridge
+  /// client is unavailable is accounted per attempt on the CALLER's thread,
+  /// same as a failed resolve (which is accounted inside the spawned
+  /// future — or, if the future is discarded before it can run, by its Drop
+  /// guard; see `Window::close` in the platform implementation).
   /// On a failed resolve tao warns and accounts the id in the destroy-failure
   /// twin queue (`drain_destroy_failures`, re-export below) so the runtime can
   /// clear its in-flight close guard; no Event is emitted for a failure.
   /// Recursion-safe against the confirmation-driven close flow: the loopback
+  /// `CloseRequested` the OS raises for the window being destroyed hits the
+  /// in-flight close guard the runtime has already set, so it is routed to
+  /// the confirmation executor's remove-or-early-exit absorb instead of
+  /// re-dispatching `close()` — the destroy request is never re-issued from
+  /// its own confirmation.
   fn close(&self);
 }
 
@@ -172,8 +184,10 @@ pub use crate::platform_impl::OHOSWindowKind;
 /// Re-export of the destroy-failure drain (issue Eulogizethesun/tauri#255):
 /// the embedding runtime (tauri-runtime-wry) drains the OHOS window ids whose
 /// `close()`-dispatched destroy failed, to clear its in-flight close guard.
-/// Same export path as the destroy-confirmation twin's platform surface
-/// ([`crate::platform_impl::OHOSWindowKind`] et al.).
+/// Same `pub use` re-export form as [`crate::platform_impl::OHOSWindowKind`];
+/// the destroy-confirmation twin is `pub(crate)`-only and has no public
+/// surface of its own — its public observable is the synthesized
+/// `Event::WindowEvent::Destroyed`, not a drain function.
 pub use crate::platform_impl::drain_destroy_failures;
 
 pub trait EventLoopBuilderExtOpenHarmony {

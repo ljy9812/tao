@@ -93,14 +93,17 @@ impl MonitorHandle {
     // of 0x0 -- a window-position restoration consumer reading 0x0 would clamp
     // to degenerate geometry (OHOS clamps negative/zero out-of-bounds to
     // (0,0)), snapping the restored window to the top-left corner.
-    // CONSCIOUS DEVIATION from the desktop backends: windows/monitor.rs and
-    // macos/monitor.rs return 0x0 for a stale monitor handle (their
-    // MonitorHandle wraps a live OS object, so 0x0 there means "never use a
-    // stale handle"); the OHOS handle is a plain display id, so falling back to
-    // the default display keeps consumers within valid geometry.
+    // CONSCIOUS DEVIATION from the desktop backends: their MonitorHandle is
+    // an id/handle too (Windows HMONITOR, macOS CGDirectDisplayID),
+    // but the OS size QUERY behind their `size()` (GetMonitorInfo /
+    // CGDisplayBounds) fails or returns zero for a disconnected display, so
+    // those backends surface 0x0 (windows/monitor.rs, macos/monitor.rs); the
+    // OHOS enumeration (all_displays) simply stops LISTING a disconnected
+    // display, which leaves a live default display to fall back to -- keeping
+    // consumers within valid geometry.
     let fallback_id = default_display();
     log::warn!(
-      "[tao ohos] display {} disconnected; falling back to default display {} size",
+      "[tao ohos] display {} snapshot missing or zero-sized (disconnected?); falling back to default display {} size",
       self.display_id,
       fallback_id
     );

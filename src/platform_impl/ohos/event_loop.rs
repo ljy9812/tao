@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use openharmony_ability::xcomponent::{Action, MouseButton as OhosMouseButton, TouchEvent};
 use openharmony_ability::{
@@ -41,8 +42,11 @@ pub(crate) const THEME_OVERRIDE_FOLLOW: u8 = 2;
 pub(crate) static APP_THEME_OVERRIDE: AtomicU8 = AtomicU8::new(THEME_OVERRIDE_FOLLOW);
 
 /// FIFO queue of deferred set-theme receipts (issue Eulogizethesun/tauri#264,
-/// design D2). `set_theme_with_receipt` pushes one receipt BEFORE the theme
-/// change is applied, and every drained completion (see
+/// design D2). A receipt is queued only AFTER the set-color-mode bridge call
+/// was ACCEPTED ([`set_app_theme`] returned `Ok` — see
+/// [`set_theme_receipt_on_bridge_result`]): a synchronously rejected call can
+/// never produce a deferred completion, so queueing its receipt would strand
+/// it at the queue head forever. Every drained completion (see
 /// [`apply_color_mode_completion`]) pops exactly one receipt — FIFO by
 /// arrival — and fires it with the verdict.
 ///
@@ -60,12 +64,30 @@ pub(crate) static APP_THEME_OVERRIDE: AtomicU8 = AtomicU8::new(THEME_OVERRIDE_FO
 /// wire so completions can be matched to their own receipt — future item,
 /// tracked in issue Eulogizethesun/tauri#264.
 ///
+/// Stranded-receipt reclamation (deadline): a receipt whose completion never
+/// arrives — the starved-concurrent form above, or a stale HAR that never
+/// delivers `notifySetColorModeSucceeded` — would otherwise sit at the queue
+/// head indefinitely: the NEXT completion pops it into a receiver the
+/// awaiting command side already dropped, and the receipt belonging to THAT
+/// completion strands in turn (every later setTheme then waits out the full
+/// command-side timeout and the verdict never reaches the current caller).
+/// Each queued entry carries its registration [`Instant`], and every drain
+/// first drops entries older than [`THEME_RECEIPT_TTL`] — silently, because
+/// the send would land in a dropped receiver anyway. Root fix = the same
+/// call-id on the wire (issue #264).
+///
 /// `Mutex::new` is const (Rust 1.63+, above this crate's 1.74 MSRV), so the
 /// queue needs no LazyLock; poison recovery follows the same
 /// `poisoned.into_inner()` discipline as the test lock below (a receipt
 /// panicking must not wedge the queue for later callers).
-static THEME_RECEIPTS: std::sync::Mutex<VecDeque<ThemeReceipt>> =
+static THEME_RECEIPTS: std::sync::Mutex<VecDeque<(Instant, ThemeReceipt)>> =
   std::sync::Mutex::new(VecDeque::new());
+
+/// Lifetime of a queued theme receipt before a drain reclaims it (see
+/// [`THEME_RECEIPTS`]). 10s sits well above the runtime's 5s command-side
+/// timeout, so reclamation only starts after the awaiting caller has already
+/// given up — a receipt is never dropped while its caller still waits.
+pub(crate) const THEME_RECEIPT_TTL: Duration = Duration::from_secs(10);
 
 /// Effective theme (override if set, else system color_mode) encoded for the
 /// ThemeChanged dispatch guard (issue Eulogizethesun/tauri#108). u8 pairs with
@@ -382,7 +404,15 @@ pub(crate) fn cursor_position_from_app(
 /// Shared set_theme: write the global override (so `theme()` immediately
 /// reflects intent) and push the color mode through the MainThreadSync bridge.
 /// Used by both `EventLoopWindowTarget::set_theme` and `Window::set_theme`.
-pub(crate) fn set_app_theme(app: &OpenHarmonyApp, theme: Option<Theme>) {
+///
+/// Returns `Err(reason)` when the bridge call was NOT accepted — no
+/// main-thread Env (e.g. a worker-thread caller: `call_sync` rejects callers
+/// outside the active ArkTS environment) or the bridge call itself returned
+/// an Err (e.g. a stale HAR that does not know `set-color-mode`). The
+/// override has already been stored by then; receipted callers roll it back
+/// via [`set_theme_receipt_on_bridge_result`] before firing `false`, while
+/// bare callers only log (their legacy contract keeps the intent mirror).
+pub(crate) fn set_app_theme(app: &OpenHarmonyApp, theme: Option<Theme>) -> Result<(), String> {
   use openharmony_ability::ColorMode;
   APP_THEME_OVERRIDE.store(
     match theme {
@@ -408,26 +438,63 @@ pub(crate) fn set_app_theme(app: &OpenHarmonyApp, theme: Option<Theme>) {
   let env_cell = openharmony_ability::get_main_thread_env();
   let env_ref = env_cell.borrow();
   if let Some(env) = env_ref.as_ref() {
-    if let Err(e) = app.set_color_mode(env, mode_i32) {
-      log::warn!("set_theme: failed to call set_color_mode: {:?}", e);
-    }
+    app
+      .set_color_mode(env, mode_i32)
+      .map_err(|e| format!("set_color_mode failed: {:?}", e))
   } else {
-    log::warn!("set_theme: main thread Env not available");
+    Err("main thread Env not available".to_string())
+  }
+}
+
+/// The receipted half of `set_theme_with_receipt`, split out so the two
+/// bridge outcomes are unit-testable without a live ArkTS session. Bridge
+/// ACCEPTED → queue the receipt for the next drained completion (the
+/// deferred ArkTS tick will produce that completion). Bridge NOT accepted →
+/// the call can never produce a deferred completion, so the receipt is fired
+/// `false` directly — after the same FOLLOW rollback the failed-completion
+/// drain performs — and is never queued. That closes the third stranding
+/// form (issue #264 / tao#31 T31-1): a queued-but-completionless receipt
+/// would sit at the queue head, the next completion would pop it into a
+/// dropped receiver, and the NEXT caller's receipt would strand in turn —
+/// every later setTheme waiting out the full command-side timeout.
+pub(crate) fn set_theme_receipt_on_bridge_result(
+  bridge_result: Result<(), String>,
+  receipt: ThemeReceipt,
+) {
+  match bridge_result {
+    Ok(()) => register_theme_receipt(receipt),
+    Err(reason) => {
+      log::error!(
+        "[tao-ohos] set_theme bridge call not accepted — rolling the theme override back to follow-system and firing the receipt false: {}",
+        reason
+      );
+      APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+      // Same ordering as the failed-completion drain: the receipt (the JS
+      // caller's failure signal) fires only after the honest rolled-back
+      // state is already in effect.
+      receipt(false);
+    }
   }
 }
 
 /// Queues one receipt for the NEXT drained completion (issue
 /// Eulogizethesun/tauri#264, design D2). Called by
-/// `EventLoopWindowTarget::set_theme_with_receipt` BEFORE
-/// [`set_app_theme`] applies the change, on the same thread — the registration
-/// is synchronous and can never be overtaken by a completion, because
-/// completions are only consumed by [`apply_color_mode_completion`] at the
-/// `MainEvent` dispatch head, which this thread cannot re-enter mid-call.
+/// `EventLoopWindowTarget::set_theme_with_receipt` AFTER
+/// [`set_app_theme`] reports the bridge call ACCEPTED, on the same thread —
+/// the registration is synchronous and can never be overtaken by a
+/// completion, because completions are only consumed by
+/// [`apply_color_mode_completion`] at the `MainEvent` dispatch head, which
+/// this thread cannot re-enter mid-call. Registering only after acceptance
+/// (instead of eagerly, before the attempt) is what closes the third
+/// stranding form: a synchronously rejected call never queues a receipt it
+/// can never get a completion for — its receipt is fired `false` directly
+/// by [`set_theme_receipt_on_bridge_result`]. The registration timestamp
+/// arms the [`THEME_RECEIPT_TTL`] reclamation.
 pub(crate) fn register_theme_receipt(receipt: ThemeReceipt) {
   let mut queue = THEME_RECEIPTS
     .lock()
     .unwrap_or_else(|poisoned| poisoned.into_inner());
-  queue.push_back(receipt);
+  queue.push_back((Instant::now(), receipt));
 }
 
 /// Pops exactly one receipt, FIFO by arrival (`None` when no receipt is
@@ -437,14 +504,40 @@ fn pop_theme_receipt() -> Option<ThemeReceipt> {
   let mut queue = THEME_RECEIPTS
     .lock()
     .unwrap_or_else(|poisoned| poisoned.into_inner());
-  queue.pop_front()
+  queue.pop_front().map(|(_, receipt)| receipt)
+}
+
+/// Drops queued receipts whose [`THEME_RECEIPT_TTL`] expired (see
+/// [`THEME_RECEIPTS`] for why they must not linger at the queue head). Runs
+/// at the head of EVERY drain — including the `None` arm — so a loop that
+/// sees no completions at all (a stale HAR) still keeps the queue bounded.
+/// Dropping rather than firing is correct: the expired receipt's receiver
+/// was already dropped by the timed-out command side, and there is no
+/// verdict to deliver anyway.
+fn sweep_expired_theme_receipts() {
+  let mut queue = THEME_RECEIPTS
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner());
+  let before = queue.len();
+  queue.retain(|(registered_at, _)| registered_at.elapsed() < THEME_RECEIPT_TTL);
+  let reclaimed = before - queue.len();
+  if reclaimed > 0 {
+    log::debug!(
+      "[tao-ohos] reclaimed {} expired theme receipt(s) — no completion arrived within {:?} (see THEME_RECEIPTS)",
+      reclaimed,
+      THEME_RECEIPT_TTL
+    );
+  }
 }
 
 /// Issue Eulogizethesun/tauri#222 drain leg: applies ONE deferred setColorMode
 /// completion (the `openharmony_ability::take_color_mode_completion()` slot —
 /// `Some(true)` executed, `Some(false)` failed, `None` nothing new). Returns
 /// whether a failure completion rolled [`APP_THEME_OVERRIDE`] back to
-/// FOLLOW (pure apart from that store — device-testable).
+/// FOLLOW. Not pure: besides that store, a verdict completion pops and fires
+/// exactly one queued receipt, and every drain (all arms) first reclaims
+/// TTL-expired receipts — all of it testable without a bridge session (the
+/// tests below serialize on the shared globals).
 ///
 /// WHY a drain and not a poll at the call site: the set-color-mode chain —
 /// `set_app_theme` → `ColorModeExt::set_color_mode` (the facade that decodes
@@ -460,24 +553,29 @@ fn pop_theme_receipt() -> Option<ThemeReceipt> {
 /// main thread — an inline bounded poll would starve it and turn every
 /// `set_theme` into a false Err. So the completion is consumed here, at the
 /// start of every MainEvent dispatch (both notify legs wake the loop, so the
-/// drain runs promptly after the deferred tick reports). Consequence: the JS
-/// caller still sees the bridge's accepted=true → Ok for this call; a failure
-/// surfaces as the error log plus the override rollback (the honest Err for
-/// the JS caller would need the call chain moved off the main thread — a
-/// worker-migration rework, deliberately out of scope here).
+/// drain runs promptly after the deferred tick reports). Consequence for
+/// BARE calls (no receipt): the JS caller still sees the bridge's
+/// accepted=true → Ok for this call; a failure surfaces as the error log
+/// plus the override rollback. RECEIPTED calls (`set_theme_with_receipt`)
+/// get the real verdict through the receipt channel below instead.
 ///
 /// Issue Eulogizethesun/tauri#264 (design D2) extends the drain with the
-/// receipt channel: `set_theme_with_receipt` queued a
-/// [`ThemeReceipt`] BEFORE applying the change, and EVERY completion
-/// carrying a verdict pops exactly one queued receipt — FIFO by arrival —
-/// and fires it with that verdict (`true` applied, `false` failed). The
-/// pairing is by arrival order, not call identity: a bare completion (from
-/// the native Rust `set_theme` or a window-level setTheme) drains while a
+/// receipt channel: a receipted call whose bridge call was ACCEPTED queued a
+/// [`ThemeReceipt`] (via [`set_theme_receipt_on_bridge_result`]; a
+/// synchronously rejected call fires its receipt `false` immediately and
+/// never queues), and EVERY completion carrying a verdict pops exactly one
+/// queued receipt — FIFO by arrival — and fires it with that verdict
+/// (`true` applied, `false` failed). The pairing is by arrival order, not
+/// call identity: a bare completion (from the native Rust `set_theme` or a
+/// window-level setTheme) drains while a
 /// JS receipt is queued wakes that receipt with the wrong verdict — the
 /// disclosed off-by-one limitation; two CONCURRENT receipted JS calls share
 /// the same single completion slot, so the first-queued receipt can receive
 /// the other call's verdict while the second starves until its command-side
-/// timeout. Root fix for both forms = call-id on the wire (future item,
+/// timeout. Residual, same family: a starved receipt whose completion never
+/// arrives is only reclaimed after [`THEME_RECEIPT_TTL`] — the command side
+/// has already timed out by then (see THEME_RECEIPTS). Root fix for all
+/// forms = call-id on the wire (future item,
 /// issue #264; see THEME_RECEIPTS). `None` carries no verdict and
 /// deliberately pops nothing, so a queued receipt is only ever woken by a
 /// completion that actually carries one. Failure ordering: the override is
@@ -487,6 +585,10 @@ fn pop_theme_receipt() -> Option<ThemeReceipt> {
 /// swallowing (the awaiting command side times out and drops its receiver:
 /// a normal outcome), so firing it here cannot panic.
 pub(crate) fn apply_color_mode_completion(completion: Option<bool>) -> bool {
+  // Reclaim TTL-expired receipts on every arm: the None arm pops no verdict
+  // receipt, but a stale-HAR loop with zero completions still needs the
+  // queue bounded (see THEME_RECEIPTS).
+  sweep_expired_theme_receipts();
   match completion {
     Some(false) => {
       log::error!(
@@ -1758,20 +1860,27 @@ impl<T: 'static> EventLoopWindowTarget<T> {
   }
 
   pub fn set_theme(&self, theme: Option<Theme>) {
-    set_app_theme(&self.app, theme);
+    // Bare call (no receipt): keep the legacy contract — the intent mirror
+    // stands even when the bridge call is rejected; log the reason only.
+    if let Err(reason) = set_app_theme(&self.app, theme) {
+      log::warn!("[tao-ohos] set_theme: bridge call not accepted (bare, intent kept): {}", reason);
+    }
   }
 
   /// Issue Eulogizethesun/tauri#264 (design D2): [`Self::set_theme`] plus a
-  /// receipt the runtime handed over for the deferred completion. Register
-  /// FIRST, then run the full existing `set_theme` pipeline — same thread,
-  /// so the receipt is queued before any completion can possibly be drained
-  /// (the drain runs at the `MainEvent` dispatch head,
-  /// [`apply_color_mode_completion`], which this synchronous call cannot
-  /// re-enter). The pre-existing [`Self::set_theme`] keeps its exact
-  /// no-receipt behavior (bare completions wake nobody).
+  /// receipt the runtime handed over for the deferred completion. Run the
+  /// full existing `set_theme` pipeline first, then hand its result and the
+  /// receipt to [`set_theme_receipt_on_bridge_result`]: the receipt is
+  /// queued only when the bridge call was ACCEPTED (same thread, so it is
+  /// queued before any completion can possibly be drained — the drain runs
+  /// at the `MainEvent` dispatch head, [`apply_color_mode_completion`],
+  /// which this synchronous call cannot re-enter), and is fired `false`
+  /// immediately — override rolled back — when the call was rejected
+  /// synchronously (no main-thread Env / bridge Err; that call can never
+  /// produce a completion). The pre-existing [`Self::set_theme`] keeps its
+  /// exact no-receipt behavior (bare completions wake nobody).
   pub fn set_theme_with_receipt(&self, theme: Option<Theme>, receipt: ThemeReceipt) {
-    register_theme_receipt(receipt);
-    set_app_theme(&self.app, theme);
+    set_theme_receipt_on_bridge_result(set_app_theme(&self.app, theme), receipt);
   }
 }
 
@@ -2953,11 +3062,12 @@ mod cursor_untracked_tests {
 }
 
 // Issue Eulogizethesun/tauri#222 — appended at file end, keeps existing line
-// numbers. apply_color_mode_completion is pure apart from the
-// APP_THEME_OVERRIDE store, so the rollback arm is testable without a bridge
-// session. APP_THEME_OVERRIDE is a process global with no other test-side
-// writer today; these tests serialize on a dedicated lock and restore FOLLOW
-// so a future theme UT starts clean.
+// numbers. apply_color_mode_completion touches exactly two process globals:
+// the APP_THEME_OVERRIDE store (rollback arm) and the THEME_RECEIPTS queue
+// (pop-and-fire on verdict completions, TTL reclamation on every drain), so
+// both arms are testable without a bridge session. APP_THEME_OVERRIDE is a
+// process global with no other test-side writer today; these tests serialize
+// on a dedicated lock and restore FOLLOW so a future theme UT starts clean.
 #[cfg(test)]
 mod color_mode_completion_tests {
   use super::*;
@@ -3294,32 +3404,27 @@ mod color_mode_completion_tests {
     clear_receipt_queue();
   }
 
-  /// UT for the register-first discipline: `set_theme_with_receipt` queues
-  /// the receipt EAGERLY — by the time the call returns (and therefore
-  /// before any completion can be drained) the receipt is already queued —
-  /// and still applies the theme change; the receipt's own override-at-fire
-  /// probe shows the applied state.
+  /// UT for the sync-rejection leg (T31-1 third stranding form, fixed):
+  /// `set_theme_with_receipt` on a bridge call that was NOT accepted — a UT
+  /// process has no ArkTS main-thread env, so `set_app_theme` returns Err,
+  /// exactly the "no main thread Env" production arm — must fire the receipt
+  /// `false` IMMEDIATELY (after rolling the override back to FOLLOW) and
+  /// never queue it: a queued-but-completionless receipt would strand at the
+  /// queue head and make every later setTheme wait out the full command-side
+  /// timeout.
   ///
   /// # Brief
-  /// 1. lock + clear queue; override := FOLLOW.
-  /// 2. build a bare EventLoopWindowTarget (a UT process has no ArkTS main
-  ///    thread env, so set_app_theme stores the override and skips the
-  ///    bridge call — exactly the state these tests run in).
-  /// 3. set_theme_with_receipt(Some(Dark), probe): queue already holds the
-  ///    receipt, override already DARK, receipt NOT yet fired.
-  /// 4. drain Some(true): receipt fires exactly once with true and reads
-  ///    override DARK.
-  ///
-  /// Register-BEFORE-apply within the method itself is not externally
-  /// observable (the synchronous call cannot be re-entered by a completion
-  /// drain); what this test pins is the externally load-bearing half: the
-  /// registration is eager, not deferred to the drain — a receipt registered
-  /// lazily would read queue-len 0 here and miss its completion.
+  /// 1. lock + clear queue; override := LIGHT (a prior intent).
+  /// 2. build a bare EventLoopWindowTarget (no ArkTS env → Err path).
+  /// 3. set_theme_with_receipt(Some(Dark), probe): receipt fired exactly
+  ///    once with false; override-at-fire already FOLLOW (rollback before
+  ///    fire); final override FOLLOW; queue stays empty (0).
+  /// 4. a later completion wakes nobody (no queued receipt).
   #[test]
-  fn ut_set_theme_with_receipt_registers_eagerly_before_apply() {
+  fn ut_set_theme_with_receipt_sync_rejection_fires_false_and_never_queues() {
     let _guard = lock_override();
     clear_receipt_queue();
-    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_LIGHT, Ordering::Relaxed);
     let target = EventLoopWindowTarget::<()> {
       app: OpenHarmonyApp::new(),
       bridge_executor: BridgeExecutor::new(),
@@ -3339,15 +3444,63 @@ mod color_mode_completion_tests {
       }),
     );
 
+    let fired = fired.lock().unwrap();
+    assert_eq!(
+      fired.as_slice(),
+      &[(false, THEME_OVERRIDE_FOLLOW)],
+      "a synchronously rejected call must fire false immediately, after the FOLLOW rollback"
+    );
+    drop(fired);
+    assert_eq!(
+      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
+      THEME_OVERRIDE_FOLLOW,
+      "the intent must be rolled back — theme() must stop reporting a change that never reached the bridge"
+    );
+    assert_eq!(
+      pending_receipt_count(),
+      0,
+      "the receipt must NOT be queued — a rejected call can never produce a deferred completion"
+    );
+    assert!(!apply_color_mode_completion(Some(true)));
+    assert_eq!(pending_receipt_count(), 0);
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    clear_receipt_queue();
+  }
+
+  /// UT for the accepted leg of the split-out dispatch helper: `Ok(())`
+  /// queues the receipt (fires nobody) and the next verdict completion
+  /// wakes it — the register-after-accept discipline that keeps the
+  /// eager-registration guarantee: by the time the call returns, the receipt
+  /// is already queued, before any completion can be drained.
+  ///
+  /// # Brief
+  /// 1. lock + clear queue; override := DARK.
+  /// 2. set_theme_receipt_on_bridge_result(Ok(()), probe): queued (len 1),
+  ///    not fired, override untouched.
+  /// 3. drain Some(true): receipt fires exactly once with true, override
+  ///    still DARK at fire time; queue empty.
+  #[test]
+  fn ut_set_theme_receipt_on_accepted_bridge_result_queues_for_completion() {
+    let _guard = lock_override();
+    clear_receipt_queue();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_DARK, Ordering::Relaxed);
+    let fired: std::sync::Arc<std::sync::Mutex<Vec<(bool, u8)>>> =
+      std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&fired);
+    set_theme_receipt_on_bridge_result(
+      Ok(()),
+      Box::new(move |applied| {
+        sink
+          .lock()
+          .unwrap()
+          .push((applied, APP_THEME_OVERRIDE.load(Ordering::Relaxed)));
+      }),
+    );
+
     assert_eq!(
       pending_receipt_count(),
       1,
-      "the receipt must already be queued when set_theme_with_receipt returns (eager registration, not drain-time)"
-    );
-    assert_eq!(
-      APP_THEME_OVERRIDE.load(Ordering::Relaxed),
-      THEME_OVERRIDE_DARK,
-      "set_app_theme must still run the full existing set_theme pipeline"
+      "an accepted bridge call must queue the receipt before the call returns (registration is eager, not drain-time)"
     );
     assert!(
       fired.lock().unwrap().is_empty(),
@@ -3362,6 +3515,70 @@ mod color_mode_completion_tests {
       "the completion wakes the receipt with the success verdict and the applied override state"
     );
     drop(fired);
+    assert_eq!(pending_receipt_count(), 0);
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
+    clear_receipt_queue();
+  }
+
+  /// UT for the TTL reclamation: a queued receipt whose completion never
+  /// arrives must be DROPPED (not fired, not left at the queue head) once
+  /// older than [`THEME_RECEIPT_TTL`], while a fresh receipt survives the
+  /// same drain. This is the stale-HAR / starved-concurrent bound: without
+  /// it, every receipted call that misses its completion strands a queue
+  /// entry forever and the next completion mis-pairs.
+  ///
+  /// # Brief
+  /// 1. lock + clear queue; forge one expired entry (registration
+  ///    timestamp pushed past the TTL) plus one fresh entry.
+  /// 2. drain None (the arm that pops no verdict receipt): expired entry
+  ///    reclaimed (len 1), fresh receipt not fired.
+  /// 3. drain Some(true): the fresh receipt fires with true.
+  #[test]
+  fn ut_theme_receipt_ttl_sweep_reclaims_only_expired_entries() {
+    let _guard = lock_override();
+    clear_receipt_queue();
+    APP_THEME_OVERRIDE.store(THEME_OVERRIDE_LIGHT, Ordering::Relaxed);
+    let expired_fired: std::sync::Arc<std::sync::Mutex<Vec<bool>>> =
+      std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let expired_sink = std::sync::Arc::clone(&expired_fired);
+    {
+      let mut queue = THEME_RECEIPTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+      queue.push_back((
+        Instant::now() - THEME_RECEIPT_TTL - Duration::from_secs(1),
+        Box::new(move |applied| {
+          expired_sink.lock().unwrap().push(applied);
+        }),
+      ));
+    }
+    let fresh_fired: std::sync::Arc<std::sync::Mutex<Vec<bool>>> =
+      std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fresh_sink = std::sync::Arc::clone(&fresh_fired);
+    register_theme_receipt(Box::new(move |applied| {
+      fresh_sink.lock().unwrap().push(applied);
+    }));
+
+    assert_eq!(pending_receipt_count(), 2);
+    // The None arm: no verdict pops, but the expired entry is reclaimed.
+    assert!(!apply_color_mode_completion(None));
+    assert_eq!(
+      pending_receipt_count(),
+      1,
+      "the TTL-expired entry must be reclaimed on a None drain; the fresh entry must survive"
+    );
+    assert!(
+      expired_fired.lock().unwrap().is_empty(),
+      "reclamation drops the expired receipt — firing it would deliver a made-up verdict"
+    );
+    assert!(fresh_fired.lock().unwrap().is_empty());
+
+    assert!(!apply_color_mode_completion(Some(true)));
+    assert_eq!(
+      fresh_fired.lock().unwrap().as_slice(),
+      &[true],
+      "the fresh receipt still pairs with its own completion"
+    );
     assert_eq!(pending_receipt_count(), 0);
     APP_THEME_OVERRIDE.store(THEME_OVERRIDE_FOLLOW, Ordering::Relaxed);
     clear_receipt_queue();

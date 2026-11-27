@@ -454,6 +454,13 @@ impl WindowBuilder {
   ///
   /// See [`Window::set_title`] for details.
   ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** the builder title is never displayed as a window
+  ///   title. Creation only uses it as the sub-window label fallback when
+  ///   no explicit label was set, and it does NOT seed the `title()` cache
+  ///   — see [`Window::title`] for the read-back semantics.
+  ///
   /// [`Window::set_title`]: crate::window::Window::set_title
   #[inline]
   pub fn with_title<T: Into<String>>(mut self, title: T) -> Self {
@@ -697,8 +704,15 @@ impl Window {
   /// - **Android:** Always returns 1.0.
   /// - **iOS:** Can only be called on the main thread. Returns the underlying `UIView`'s
   ///   [`contentScaleFactor`].
+  /// - **OpenHarmony:** returns the app-level display density (the live
+  ///   default-display value from the NDK), not a per-window value. The
+  ///   user font-size setting is deliberately kept out of this getter, so
+  ///   the value differs from the composite reported by
+  ///   [`WindowEvent::ScaleFactorChanged`] — see that event's OpenHarmony
+  ///   note.
   ///
   /// [`contentScaleFactor`]: https://developer.apple.com/documentation/uikit/uiview/1622657-contentscalefactor?language=objc
+  /// [`WindowEvent::ScaleFactorChanged`]: crate::event::WindowEvent::ScaleFactorChanged
   #[inline]
   pub fn scale_factor(&self) -> f64 {
     self.window.scale_factor()
@@ -885,6 +899,10 @@ impl Window {
   /// ## Platform-specific
   ///
   /// - **iOS / Android:** Unsupported.
+  /// - **OpenHarmony:** intent mirror. The title text only shows in the
+  ///   sub-window title bar (decorations enabled); the intent is cached
+  ///   locally even when the bridge dispatch fails, so a later
+  ///   [`Window::title`] still reports it.
   #[inline]
   pub fn set_title(&self, title: &str) {
     self.window.set_title(title)
@@ -894,7 +912,12 @@ impl Window {
   ///
   /// ## Platform-specific
   ///
-  /// - **iOS / Android:** Unsupported. Returns ane empty string.
+  /// - **iOS / Android:** Unsupported. Returns an empty string.
+  /// - **OpenHarmony:** there is no synchronous OS title query, so this
+  ///   reads an app-owned cache of the last [`Window::set_title`] intent.
+  ///   A window that was never `set_title`-d returns the empty string
+  ///   (the builder title does not seed the cache — see
+  ///   [`WindowBuilder::with_title`]).
   #[inline]
   pub fn title(&self) -> String {
     self.window.title()

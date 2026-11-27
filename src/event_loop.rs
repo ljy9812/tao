@@ -262,10 +262,19 @@ impl<T> Deref for EventLoop<T> {
 ///   rolled back to follow-system by the time the receipt fires, so the
 ///   closure sees the honest state and the JS caller can surface a real Err.
 ///
+/// `false` also fires immediately — never queued — when the bridge call
+/// itself was rejected synchronously (no main-thread Env, e.g. a
+/// worker-thread caller, or a bridge Err, e.g. a stale HAR): such a call can
+/// never produce a deferred completion, and the override is rolled back
+/// before the receipt fires, exactly as for a reported failure.
+///
 /// Pairing is by arrival order, not call identity: a bare completion (native
 /// `set_theme`, window-level setTheme) or a second concurrent receipted JS
 /// call can wake a queued receipt with the other call's verdict — the second
-/// receipt then starves until its command-side timeout. Disclosed limitation;
+/// receipt then starves until its command-side timeout. A starved receipt
+/// whose completion never arrives is dropped (not fired) once it outlives a
+/// TTL set above that timeout, so it cannot strand at the queue head and
+/// delay later callers' verdicts. Disclosed limitation;
 /// root fix = a call-id on the setColorMode wire (issue
 /// Eulogizethesun/tauri#264).
 ///

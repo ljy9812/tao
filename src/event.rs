@@ -505,6 +505,20 @@ pub enum WindowEvent<'a> {
   /// by the OS, but it can be changed to any value.
   ///
   /// For more information about DPI in general, see the [`dpi`] module.
+  ///
+  /// ## Platform-specific
+  ///
+  /// - **OpenHarmony:** the `scale_factor` payload is the composite
+  ///   `display density × font_size_scale` (the font-size setting is the
+  ///   user-reachable setting that drives this event), so it can differ
+  ///   from [`Window::scale_factor`], which keeps returning the bare
+  ///   density. `new_inner_size` carries a snapshot of the window's
+  ///   current inner size; writing to it does NOT trigger a physical
+  ///   resize on OpenHarmony (no OS resize hook runs after this event).
+  ///   Display-size ("显示大小"/VPR) changes forward nothing — neither
+  ///   leg of the composite moves.
+  ///
+  /// [`Window::scale_factor`]: crate::window::Window::scale_factor
   ScaleFactorChanged {
     /// The new scale factor of the window.
     scale_factor: f64,
